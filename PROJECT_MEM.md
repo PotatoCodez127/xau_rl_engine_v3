@@ -139,3 +139,15 @@ To reduce execution frequency to a realistic retail range (1–2 trades/day) and
 * **Results:** The Hybrid Execution Model successfully filtered out ~100 counter-trend executions. Total trades dropped to 206, and the True Winrate rebounded to 35.44%.
 * **Financial Metrics:** The positive expectancy of the 35% winrate combined with the 1.0R-3.0R Asymmetric Floor and 1.5% Dynamic Compounding yielded a final Out-Of-Sample Equity of $15,505.80 (+55.05% Net Return).
 * **Conclusion:** The core algorithmic and neural architecture of the XAU RL Engine V2 is mathematically sound, successfully overriding previous limitations of Risk Inversion and Mode Collapse.
+
+## 28. V3.2 Architecture Arbitration (Executive Override)
+* **Diagnosis:** The previous roadmap relied on theoretical optimization (Mamba, VPIN, Continuous MFE rewards) that posed massive computational friction, statistical L2 fallacies, and structural look-ahead bias.
+* **Resolution:** The CIO enforced a strict pivot to practical execution mechanics. 
+  1. **Phase A:** Stick to PatchTST (reject Mamba).
+  2. **Feature Pipeline:** Scrap VPIN. Rely on pure Price-Action Dynamics (ATR-Normalized Liquidity Void Velocity).
+  3. **Phase B:** Transition to a Distributional SAC (reject standard scalar $Q$-values) and replace continuous rewards with Episodic Checkpoints to cure holdout leakage.
+
+## 29. Sizing Engine Overhaul: Regime-Modulated Half-Kelly
+* **Objective:** Transition from fixed 1.5% volumetric compounding to dynamic, mathematical sizing without triggering neural network retraining.
+* **Implementation:** Deployed a discrete step-function in `live_simulator.py`. Risk sizing is now calculated continuously using the Kelly Criterion ($p - (1-p)/b$) driven by a blend of the Phase A Oracle's real-time confidence and the WFA OOS historical winrate.
+* **Protection Mechanisms:** The raw fraction is halved (Half-Kelly) and modulated inversely by the `h1_vol_regime` (throttling risk by up to 25% during macro sweeps). The output is rigidly quantized to MetaTrader 5 FIX API compliance (0.01 lot increments).
