@@ -167,7 +167,7 @@ class HighFidelitySimulator:
 
                     active_trade = None
                     continue
-
+            
             # --- 2. EXECUTE PENDING QUEUE (Latency Simulation $t$) ---
             if pending_signal is not None and active_trade is None:
                 fill_price = current_bar["env_open"]
@@ -179,13 +179,41 @@ class HighFidelitySimulator:
                 else:
                     fill_price -= slippage_pips * 0.1
 
-                # --- NEW: Volumetric Math with Compounding ---
                 sl_pips = pending_signal["sl_distance"]
-                current_risk_usd = equity * self.risk_pct
+
+                # --- NEW: Regime-Modulated Fractional Half-Kelly ---
+                # 1. Expected Winrate (Oracle Conviction blended with OOS Baseline)
+                wfa_baseline_winrate = 0.3622
+                p = (pending_signal["prob_win"] + wfa_baseline_winrate) / 2.0
+                
+                # 2. Odds (Reward-to-Risk)
+                b = pending_signal["reward_to_risk"]
+
+                # 3. Kelly Criterion Formula
+                kelly_fraction = p - ((1.0 - p) / b) if b > 0 else 0.0
+                
+                # 4. Fractional Half-Kelly Floor
+                # Floor at 0.1% to allow the agent to execute low-conviction structural trades without risking ruin
+                half_kelly = max(kelly_fraction / 2.0, 0.001) 
+                
+                # 5. Volatility Regime Modulation
+                # Throttle sizing by up to 25% during violent H1 volatility percentiles (protect against macro sweeps)
+                regime_scalar = 1.0 - (pending_signal["h1_vol_regime"] * 0.25)
+                
+                final_risk_pct = half_kelly * regime_scalar
+                
+                # Ceiling at 5% to prevent catastrophic failure on model hallucination
+                final_risk_pct = np.clip(final_risk_pct, 0.001, 0.05)
+                
+                current_risk_usd = equity * final_risk_pct
 
                 # Lot_Volume = Current_Risk_USD / (SL_Pips * Pip_Value)
-                lot_size = current_risk_usd / (sl_pips * self.pip_value_per_lot)
-                lot_size = round(np.clip(lot_size, 0.01, 100.0), 2)
+                theoretical_lot_size = current_risk_usd / (sl_pips * self.pip_value_per_lot)
+                
+                # --- DISCRETE MT5 FIX API STEP-FUNCTION ---
+                # Valid MetaTrader lot sizing: Min 0.01, Max 100.00, Step 0.01
+                lot_size = round(theoretical_lot_size, 2)
+                lot_size = np.clip(lot_size, 0.01, 100.0)
 
                 commission = lot_size * self.commission_per_lot
                 spread_cost = lot_size * self.spread_pips * self.pip_value_per_lot
@@ -214,9 +242,6 @@ class HighFidelitySimulator:
                 pending_signal = None
                 continue
 
-            # --- 3. SIGNAL GENERATION (The Oracle / Manager) ---
-            # Signal Generation
-            # Signal Generation
             # Signal Generation
             if sim.is_restricted_time(current_time):
                 continue
@@ -261,11 +286,15 @@ class HighFidelitySimulator:
 
                 sl_mult = ((sl_val + 1.0) / 2.0) * 1.0 + 0.5
                 tp_mult = sl_mult * (((tp_val + 1.0) / 2.0) * 2.0 + 1.0)
+                reward_to_risk = tp_mult / sl_mult
 
                 pending_signal = {
                     "type": "Long" if direction == 1 else "Short",
                     "sl_distance": (current_bar["env_atr"] * sl_mult) * 10,
                     "tp_distance": (current_bar["env_atr"] * tp_mult) * 10,
+                    "prob_win": prob_long if direction == 1 else prob_short,
+                    "h1_vol_regime": current_bar["h1_vol_regime"],
+                    "reward_to_risk": reward_to_risk
                 }
 
             equity_curve.append(equity)
