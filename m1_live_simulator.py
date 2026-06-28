@@ -6,9 +6,111 @@ import pandas as pd
 from datetime import timezone
 from stable_baselines3 import SAC
 from models.oracle.attention_net import TemporalAttentionOracle
+import pandas as pd
+import numpy as np
 
-# --- PASTE DualM1DataFeed CLASS HERE ---
-# --- PASTE StreamingFeatureEngine CLASS HERE ---
+class DualM1DataFeed:
+    """Mimics a live MT5 terminal receiving ticks from multiple symbols simultaneously."""
+    def __init__(self, xau_m1_path, dxy_m1_path):
+        print("Initializing Synchronized Dual-Stream M1 Feed...")
+        
+        # 1. Load and parse both feeds
+        xau_df = self._parse_mt_csv(xau_m1_path).add_prefix("xau_")
+        dxy_df = self._parse_mt_csv(dxy_m1_path).add_prefix("dxy_")
+        
+        # 2. Synchronize the streams (Inner Join ensures no missing correlation data)
+        self.master_stream = xau_df.join(dxy_df, how="inner")
+        print(f"Dual-Stream synchronized. Total alignable M1 ticks: {len(self.master_stream)}")
+
+    def _parse_mt_csv(self, filepath):
+        separator = "\t" if len(pd.read_csv(filepath, nrows=1, sep="\t").columns) > 1 else ","
+        df = pd.read_csv(filepath, sep=separator)
+        df.columns = [c.strip("<>").lower() for c in df.columns]
+        df["datetime"] = pd.to_datetime(df["date"] + " " + df["time"], format="%Y.%m.%d %H:%M:%S")
+        df.set_index("datetime", inplace=True)
+        return df[["open", "high", "low", "close"]] # Strip fluff, keep HLOC
+
+    def stream(self):
+        """Yields one synchronized row of XAU and DXY data at a time."""
+        for timestamp, row in self.master_stream.iterrows():
+            yield timestamp, row
+
+
+class StreamingFeatureEngine:
+    """Stateful feature builder supporting cross-asset correlation."""
+    def __init__(self, window_size=1000):
+        self.history_limit = window_size 
+        self.m1_buffer = []
+        self.m15_history = pd.DataFrame()
+        self.is_warmed_up = False
+
+    def process_m1_tick(self, timestamp, tick_row):
+        self.m1_buffer.append(tick_row)
+        
+        # Close 15m candle on the 00, 15, 30, 45 minute marks
+        if timestamp.minute % 15 == 0 and len(self.m1_buffer) > 0:
+            features = self._close_15m_candle(timestamp)
+            self.m1_buffer = [] 
+            return features
+        return None
+
+    def _close_15m_candle(self, timestamp):
+        m1_df = pd.DataFrame(self.m1_buffer)
+        
+        # Synthesize XAU 15m Bar
+        new_15m = pd.DataFrame({
+            "open": [m1_df["xau_open"].iloc[0]],
+            "high": [m1_df["xau_high"].max()],
+            "low": [m1_df["xau_low"].min()],
+            "close": [m1_df["xau_close"].iloc[-1]],
+            "dxy_close": [m1_df["dxy_close"].iloc[-1]] # Capture DXY close for correlation
+        }, index=[timestamp])
+
+        self.m15_history = pd.concat([self.m15_history, new_15m])
+        
+        if len(self.m15_history) > self.history_limit:
+            self.m15_history = self.m15_history.iloc[-self.history_limit:]
+            self.is_warmed_up = True
+
+        if self.is_warmed_up:
+            return self._calculate_current_features()
+        return None
+
+    def _calculate_current_features(self):
+        df = self.m15_history.copy()
+        
+        # 1. Standard Price Features (ATR, Trend, Volatility)
+        high_low = df["high"] - df["low"]
+        high_close = np.abs(df["high"] - df["close"].shift())
+        low_close = np.abs(df["low"] - df["close"].shift())
+        df["env_atr"] = np.max(pd.concat([high_low, high_close, low_close], axis=1), axis=1).rolling(14).mean()
+
+        ema_50h = df["close"].ewm(span=200, adjust=False).mean()
+        ema_200h = df["close"].ewm(span=800, adjust=False).mean()
+        df["h4_trend"] = (ema_50h - ema_200h) / ema_200h
+
+        h1_high = df["high"].rolling(window=4).max()
+        h1_low = df["low"].rolling(window=4).min()
+        df["h1_vol_regime"] = (h1_high - h1_low).rolling(window=96).rank(pct=True)
+        
+        # 2. Fractional Differentiation
+        weights = self._get_fractional_weights(0.45, 50)
+        last_50_close = df["close"].iloc[-50:].values
+        df.loc[df.index[-1], "close_frac_diff"] = np.dot(last_50_close, weights)[0]
+
+        # 3. INTERMARKET CORRELATION (DXY)
+        # Replicating step 4 from build_features.py exactly
+        df["dxy_pct_change_15m"] = df["dxy_close"].pct_change()
+
+        # Needs to return the final assembled dictionary exactly matching the Oracle's expected inputs
+        return df.iloc[-1].to_dict()
+
+    def _get_fractional_weights(self, d: float, size: int) -> np.ndarray:
+        w = [1.0]
+        for k in range(1, size):
+            w_ = -w[-1] / k * (d - k + 1)
+            w.append(w_)
+        return np.array(w[::-1]).reshape(-1, 1)
 
 class M1HighFidelitySimulator:
     def __init__(self, xau_path, dxy_path, oracle_path, manager_path):
