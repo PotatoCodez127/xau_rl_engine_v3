@@ -9,14 +9,21 @@ from models.oracle.attention_net import TemporalAttentionOracle
 
 class DualM1DataFeed:
     """Mimics a live MT5 terminal receiving ticks from multiple symbols simultaneously."""
-    def __init__(self, xau_m1_path, dxy_m1_path):
+    def __init__(self, xau_m1_path, dxy_m1_path, slice_data=True):
         print("Initializing Synchronized Dual-Stream M1 Feed...")
         
         xau_df = self._parse_mt_csv(xau_m1_path).add_prefix("xau_")
         dxy_df = self._parse_mt_csv(dxy_m1_path).add_prefix("dxy_")
         
         self.master_stream = xau_df.join(dxy_df, how="inner")
-        print(f"Dual-Stream synchronized. Total alignable M1 ticks: {len(self.master_stream)}")
+        
+        if slice_data:
+            # Keep only the last 25% of the data (5% for warm-up, 20% for testing)
+            slice_idx = int(len(self.master_stream) * 0.6)
+            self.master_stream = self.master_stream.iloc[slice_idx:]
+            print(f"Dataset pre-sliced. Starting simulation at tick index {slice_idx}")
+            
+        print(f"Dual-Stream synchronized. Total ticks to process: {len(self.master_stream)}")
 
     def _parse_mt_csv(self, filepath):
         separator = "\t" if len(pd.read_csv(filepath, nrows=1, sep="\t").columns) > 1 else ","
@@ -225,40 +232,46 @@ class M1HighFidelitySimulator:
         total_ticks = len(self.feed.master_stream)
         holdout_start_idx = int(total_ticks * 0.8)
         
-        print(f"Executing M1 Tick-Level Backtest Engine...")
-        print(f"Total Ticks: {total_ticks} | Enforcing OOS Firewall at Index: {holdout_start_idx}")
+        print(f"Executing Sequential Challenge Yield Tester...")
+        print(f"Enforcing OOS Firewall at Index: {holdout_start_idx}")
 
+        # Core State
         equity = self.initial_balance
         high_water_mark = self.initial_balance
         daily_start_equity = self.initial_balance
         current_day = None
         
         trading_locked_for_day = False
-        account_failed = False
-        account_passed = False
-
+        
+        # Challenge Yield Trackers
+        challenge_history = []
+        current_challenge_start_time = None
+        trades_in_current_challenge = 0
+        
         journal = []
         active_trade = None
         pending_signal = None
         bars_since_last_trade = 0 
-
         latency_logs = []
 
         # START EVENT LOOP
         for idx, (timestamp, tick_row) in enumerate(self.feed.stream()):
-            
+            if idx % 10000 == 0:
+              progress_pct = (idx / total_ticks) * 100
+              status = "WARMUP (In-Sample)" if idx < holdout_start_idx else "ACTIVE (Out-of-Sample)"
+              print(f"[{timestamp}] Progress: {progress_pct:.2f}% ({idx}/{total_ticks}) | Status: {status} | Equity: ${equity:.2f}")
             # --- 1. STATEFUL FEATURE FEED (Warm-Up Mode) ---
-            # We process all ticks to ensure the EMAs and sliding windows are primed
             latest_15m_features = self.engine.process_m1_tick(timestamp, tick_row)
-            
             if latest_15m_features is not None:
                 feature_vector = [latest_15m_features.get(c, 0.0) if not np.isnan(latest_15m_features.get(c, 0.0)) else 0.0 for c in self.feature_cols]
                 self.feature_buffer.append(feature_vector)
             
             # --- OOS FIREWALL GATE ---
-            # Do not execute trades or track equity on the in-sample training data
             if idx < holdout_start_idx:
                 continue
+                
+            if current_challenge_start_time is None:
+                current_challenge_start_time = timestamp
             
             # --- 2. UTC Temporal Synchronization ---
             if current_day is None:
@@ -270,6 +283,9 @@ class M1HighFidelitySimulator:
                 trading_locked_for_day = False
 
             # --- 3. M1 TICK-LEVEL TRADE MANAGEMENT ---
+            account_failed = False
+            account_passed = False
+            
             if active_trade is not None:
                 trade_closed = False
                 exit_price = 0.0
@@ -315,6 +331,7 @@ class M1HighFidelitySimulator:
                     gross_pnl = (pip_diff * self.pip_value_per_lot * active_trade["lot_size"])
                     net_pnl = gross_pnl - active_trade["total_friction"]
                     equity += net_pnl
+                    trades_in_current_challenge += 1
 
                     if equity > high_water_mark:
                         high_water_mark = equity
@@ -331,6 +348,7 @@ class M1HighFidelitySimulator:
                     active_trade = None
                     continue
 
+            # Check Global Breakers for Idle state
             if active_trade is None:
                 if equity <= (daily_start_equity - self.max_daily_loss):
                     trading_locked_for_day = True
@@ -339,8 +357,31 @@ class M1HighFidelitySimulator:
                 if equity >= self.profit_target:
                     account_passed = True
 
+            # ==========================================
+            # SEQUENTIAL RESTART LOGIC
+            # ==========================================
             if account_failed or account_passed:
-                break
+                result = "PASSED" if account_passed else "FAILED"
+                print(f"[{timestamp}] Challenge {result}! Final Equity: ${equity:.2f} | Trades: {trades_in_current_challenge}")
+                
+                challenge_history.append({
+                    "Start_Time": current_challenge_start_time,
+                    "End_Time": timestamp,
+                    "Result": result,
+                    "Final_Equity": round(equity, 2),
+                    "Trades_Taken": trades_in_current_challenge
+                })
+                
+                # Instantly reset all tracking variables to buy a new challenge
+                equity = self.initial_balance
+                high_water_mark = self.initial_balance
+                daily_start_equity = self.initial_balance
+                trading_locked_for_day = False
+                current_challenge_start_time = timestamp
+                trades_in_current_challenge = 0
+                active_trade = None
+                pending_signal = None
+                continue # Skip the rest of this tick to start fresh on the next
 
             # --- 4. EXECUTE PENDING QUEUE ---
             if pending_signal is not None and active_trade is None:
@@ -422,17 +463,28 @@ class M1HighFidelitySimulator:
                     latency_ms = (end_time - start_time) * 1000
                     latency_logs.append(latency_ms)
 
-        journal_df = pd.DataFrame(journal)
-        print("\n" + "=" * 50)
-        print(" M1 ULTRA-FIDELITY SIMULATION REPORT (V3.2) ")
-        print("=" * 50)
-        print(f"Total Trades Executed: {len(journal_df)}")
-        print(f"Account Passed:        {account_passed}")
-        print(f"Account Failed:        {account_failed}")
-        if latency_logs:
-            print(f"Avg AI Execution Latency: {np.mean(latency_logs):.2f} ms")
-            print(f"Max AI Execution Latency: {np.max(latency_logs):.2f} ms")
-        print("=" * 50)
+        # Print Final Report
+        yield_df = pd.DataFrame(challenge_history)
+        print("\n" + "=" * 60)
+        print(" SEQUENTIAL CHALLENGE YIELD REPORT (OOS Period) ")
+        print("=" * 60)
+        
+        if not yield_df.empty:
+            total_attempts = len(yield_df)
+            passes = len(yield_df[yield_df['Result'] == 'PASSED'])
+            fails = len(yield_df[yield_df['Result'] == 'FAILED'])
+            
+            print(f"Total Challenges Attempted: {total_attempts}")
+            print(f"Challenges PASSED:          {passes}")
+            print(f"Challenges FAILED:          {fails}")
+            print(f"Yield Winrate:              {(passes/total_attempts)*100:.2f}%")
+            print("-" * 60)
+            print("Detailed Run History:")
+            print(yield_df.to_string(index=False))
+        else:
+            print("No challenges completed. The OOS period may be too short, or no trades were taken.")
+            
+        print("=" * 60)
 
 if __name__ == "__main__":
     XAU = "data/raw/XAUUSDr_M1.csv"
