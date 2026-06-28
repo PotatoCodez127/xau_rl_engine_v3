@@ -6,19 +6,15 @@ import pandas as pd
 from datetime import timezone
 from stable_baselines3 import SAC
 from models.oracle.attention_net import TemporalAttentionOracle
-import pandas as pd
-import numpy as np
 
 class DualM1DataFeed:
     """Mimics a live MT5 terminal receiving ticks from multiple symbols simultaneously."""
     def __init__(self, xau_m1_path, dxy_m1_path):
         print("Initializing Synchronized Dual-Stream M1 Feed...")
         
-        # 1. Load and parse both feeds
         xau_df = self._parse_mt_csv(xau_m1_path).add_prefix("xau_")
         dxy_df = self._parse_mt_csv(dxy_m1_path).add_prefix("dxy_")
         
-        # 2. Synchronize the streams (Inner Join ensures no missing correlation data)
         self.master_stream = xau_df.join(dxy_df, how="inner")
         print(f"Dual-Stream synchronized. Total alignable M1 ticks: {len(self.master_stream)}")
 
@@ -28,7 +24,7 @@ class DualM1DataFeed:
         df.columns = [c.strip("<>").lower() for c in df.columns]
         df["datetime"] = pd.to_datetime(df["date"] + " " + df["time"], format="%Y.%m.%d %H:%M:%S")
         df.set_index("datetime", inplace=True)
-        return df[["open", "high", "low", "close"]] # Strip fluff, keep HLOC
+        return df[["open", "high", "low", "close"]] 
 
     def stream(self):
         """Yields one synchronized row of XAU and DXY data at a time."""
@@ -98,7 +94,6 @@ class StreamingFeatureEngine:
         df["dxy_pct_change_15m"] = df["dxy_close"].pct_change()
 
         # --- 2. Multi-Timeframe Wick Zones & Levels ---
-        # 15m Zones
         df["ema_50"] = df["close"].ewm(span=50, adjust=False).mean()
         df["rolling_max_15m"] = df["high"].rolling(window=11, center=False).max()
         df["rolling_min_15m"] = df["low"].rolling(window=11, center=False).min()
@@ -113,7 +108,6 @@ class StreamingFeatureEngine:
         for col in ["res_zone_top_15m", "res_zone_bottom_15m", "sup_zone_top_15m", "sup_zone_bottom_15m"]:
             df[col] = df[col].ffill()
 
-        # 30m Zones
         df_30m = df.resample("30min").agg({"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
         df_30m["rolling_max"] = df_30m["high"].rolling(window=11, center=False).max()
         df_30m["rolling_min"] = df_30m["low"].rolling(window=11, center=False).min()
@@ -128,7 +122,6 @@ class StreamingFeatureEngine:
         for col in ["res_zone_top_30m", "res_zone_bottom_30m", "sup_zone_top_30m", "sup_zone_bottom_30m"]:
             df_30m[col] = df_30m[col].ffill()
 
-        # 4H Zones
         df_4h = df.resample("4h").agg({"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
         df_4h["rolling_max"] = df_4h["high"].rolling(window=11, center=False).max()
         df_4h["rolling_min"] = df_4h["low"].rolling(window=11, center=False).min()
@@ -143,7 +136,6 @@ class StreamingFeatureEngine:
         for col in ["res_zone_top_4h", "res_zone_bottom_4h", "sup_zone_top_4h", "sup_zone_bottom_4h"]:
             df_4h[col] = df_4h[col].ffill()
 
-        # Daily Levels
         daily = df.resample("D").agg({"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
         daily["prev_high"] = daily["high"].shift(1)
         daily["prev_low"] = daily["low"].shift(1)
@@ -153,7 +145,6 @@ class StreamingFeatureEngine:
         daily["R1"] = (2 * daily["pivot"]) - daily["prev_low"]
         daily["S1"] = (2 * daily["pivot"]) - daily["prev_high"]
 
-        # Merge
         df = pd.merge_asof(df, df_30m[["res_zone_top_30m", "res_zone_bottom_30m", "sup_zone_top_30m", "sup_zone_bottom_30m"]], left_index=True, right_index=True)
         df = pd.merge_asof(df, df_4h[["res_zone_top_4h", "res_zone_bottom_4h", "sup_zone_top_4h", "sup_zone_bottom_4h"]], left_index=True, right_index=True)
         df = pd.merge_asof(df, daily[["daily_eq", "pivot", "R1", "S1"]], left_index=True, right_index=True)
@@ -186,12 +177,10 @@ class M1HighFidelitySimulator:
         self.feed = DualM1DataFeed(xau_path, dxy_path)
         self.engine = StreamingFeatureEngine(window_size=1000)
 
-        # Broker & Risk Constants
         self.commission_per_lot = 5.00
         self.spread_pips = 2.0
         self.pip_value_per_lot = 10.0
 
-        # --- PROP FIRM LIMITS ---
         self.initial_balance = 5000.0
         self.fixed_risk_usd = 20.00
         self.consistency_cap_usd = 37.50
@@ -200,12 +189,11 @@ class M1HighFidelitySimulator:
         self.max_daily_loss = 150.00
         self.max_trailing_loss = 250.00
         self.profit_target = 5250.00
-        self.min_bars_between_trades = 96 # Based on 15m bars
+        self.min_bars_between_trades = 96 
 
         self._load_models(oracle_path, manager_path)
 
     def _load_models(self, oracle_path, manager_path):
-        # Explicit 25-Dimension Mapping required by PyTorch Model
         self.feature_cols = [
             "h4_trend", "h1_vol_regime", "close_frac_diff", "mom_1_norm", "mom_4_norm", "dxy_pct_change_15m",
             "dist_ema_50_norm", "dist_rolling_max_15m_norm", "dist_rolling_min_15m_norm",
@@ -223,7 +211,6 @@ class M1HighFidelitySimulator:
 
         self.manager = SAC.load(manager_path, device=self.device)
         
-        # Initialize the 30-period sliding window required by the Oracle
         from collections import deque
         self.feature_buffer = deque(maxlen=30)
 
@@ -235,7 +222,11 @@ class M1HighFidelitySimulator:
         return False
 
     def run_simulation(self):
+        total_ticks = len(self.feed.master_stream)
+        holdout_start_idx = int(total_ticks * 0.8)
+        
         print(f"Executing M1 Tick-Level Backtest Engine...")
+        print(f"Total Ticks: {total_ticks} | Enforcing OOS Firewall at Index: {holdout_start_idx}")
 
         equity = self.initial_balance
         high_water_mark = self.initial_balance
@@ -249,30 +240,42 @@ class M1HighFidelitySimulator:
         journal = []
         active_trade = None
         pending_signal = None
-        bars_since_last_trade = 0 # 15m bars
+        bars_since_last_trade = 0 
 
         latency_logs = []
 
-        # START EVENT LOOP (Simulating MT5 OnTick)
-        for timestamp, tick_row in self.feed.stream():
+        # START EVENT LOOP
+        for idx, (timestamp, tick_row) in enumerate(self.feed.stream()):
             
-            # Initialize daily tracker
+            # --- 1. STATEFUL FEATURE FEED (Warm-Up Mode) ---
+            # We process all ticks to ensure the EMAs and sliding windows are primed
+            latest_15m_features = self.engine.process_m1_tick(timestamp, tick_row)
+            
+            if latest_15m_features is not None:
+                feature_vector = [latest_15m_features.get(c, 0.0) if not np.isnan(latest_15m_features.get(c, 0.0)) else 0.0 for c in self.feature_cols]
+                self.feature_buffer.append(feature_vector)
+            
+            # --- OOS FIREWALL GATE ---
+            # Do not execute trades or track equity on the in-sample training data
+            if idx < holdout_start_idx:
+                continue
+            
+            # --- 2. UTC Temporal Synchronization ---
             if current_day is None:
                 current_day = timestamp.date()
 
-            # UTC Temporal Synchronization for Daily Reset
             if timestamp.date() > current_day:
                 daily_start_equity = equity
                 current_day = timestamp.date()
                 trading_locked_for_day = False
 
-            # --- 1. M1 TICK-LEVEL TRADE MANAGEMENT ---
+            # --- 3. M1 TICK-LEVEL TRADE MANAGEMENT ---
             if active_trade is not None:
                 trade_closed = False
                 exit_price = 0.0
                 exit_reason = ""
 
-                current_price = tick_row["xau_close"] # Using M1 close for tick simulation
+                current_price = tick_row["xau_close"]
                 current_distance_pips = (current_price - active_trade["entry"]) * 10.0
                 if active_trade["type"] == "Short":
                     current_distance_pips = -current_distance_pips
@@ -280,7 +283,6 @@ class M1HighFidelitySimulator:
                 floating_pnl = current_distance_pips * self.pip_value_per_lot * active_trade["lot_size"] - active_trade["total_friction"]
                 current_floating_equity = equity + floating_pnl
 
-                # Global Circuit Breakers
                 if current_floating_equity <= (daily_start_equity - self.max_daily_loss):
                     trade_closed, exit_price, exit_reason = (True, current_price, "Daily Drawdown Breached")
                     trading_locked_for_day = True
@@ -290,14 +292,10 @@ class M1HighFidelitySimulator:
                 elif current_floating_equity >= self.profit_target:
                     trade_closed, exit_price, exit_reason = (True, current_price, "Profit Target Reached")
                     account_passed = True
-                
-                # Tick-Level Prop Firm Rule Overrides (No more 15m Slippage)
                 elif floating_pnl <= self.guardian_shield_loss:
                     trade_closed, exit_price, exit_reason = (True, current_price, "Guardian Shield (1% Loss)")
                 elif floating_pnl >= self.consistency_cap_usd:
                     trade_closed, exit_price, exit_reason = (True, current_price, "Consistency Hard Clip (15% Rule)")
-                
-                # Standard TP/SL
                 elif active_trade["type"] == "Long":
                     if tick_row["xau_low"] <= active_trade["sl"]:
                         trade_closed, exit_price, exit_reason = (True, active_trade["sl"], "Stop Loss")
@@ -333,7 +331,6 @@ class M1HighFidelitySimulator:
                     active_trade = None
                     continue
 
-            # Check Global Breakers for Idle state
             if active_trade is None:
                 if equity <= (daily_start_equity - self.max_daily_loss):
                     trading_locked_for_day = True
@@ -345,7 +342,7 @@ class M1HighFidelitySimulator:
             if account_failed or account_passed:
                 break
 
-            # --- 2. EXECUTE PENDING QUEUE (Latency Simulation $t$) ---
+            # --- 4. EXECUTE PENDING QUEUE ---
             if pending_signal is not None and active_trade is None:
                 fill_price = tick_row["xau_open"]
                 sl_distance_pips = max(pending_signal["sl_distance"], 10.0)
@@ -368,31 +365,22 @@ class M1HighFidelitySimulator:
                 pending_signal = None
                 continue
 
-            # --- 3. STATEFUL FEATURE FEED (OnBarClose) ---
-            latest_15m_features = self.engine.process_m1_tick(timestamp, tick_row)
-            
+            # --- 5. NEURAL INFERENCE (Triggered Only on 15m Close) ---
             if latest_15m_features is not None:
                 bars_since_last_trade += 1
-                
-                # Append to sliding window safely, filling NaNs (common during warm-up) with 0.0
-                feature_vector = [latest_15m_features.get(c, 0.0) if not np.isnan(latest_15m_features.get(c, 0.0)) else 0.0 for c in self.feature_cols]
-                self.feature_buffer.append(feature_vector)
                 
                 if trading_locked_for_day or self.is_restricted_time(timestamp):
                     continue
 
-                # Execute Inference ONLY if buffer is full
                 if len(self.feature_buffer) == 30:
                     start_time = time.perf_counter()
 
-                    # Phase A: Oracle
                     window_tensor = torch.FloatTensor(np.array(self.feature_buffer)).unsqueeze(0).to(self.device)
                     with torch.no_grad():
                         logits = self.oracle(window_tensor)
                         probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
                     prob_hold, prob_long, prob_short = probs[0], probs[1], probs[2]
 
-                    # Gating execution logic
                     EXECUTION_THRESHOLD = 0.35
                     current_h4_trend = latest_15m_features.get("h4_trend", 0)
                     direction = 0
@@ -407,19 +395,13 @@ class M1HighFidelitySimulator:
                     if direction != 0 and bars_since_last_trade < self.min_bars_between_trades:
                         direction = 0
 
-                    # Phase B: Manager (Strict 31-value dimension established in Walk-Forward)
                     if direction != 0:
                         obs = np.zeros(31, dtype=np.float32)
                         
-                        # 1. The 25 Market Features
                         obs[:25] = feature_vector
-                        
-                        # 2. The 3 Oracle Probabilities
                         obs[25] = prob_hold
                         obs[26] = prob_long
                         obs[27] = prob_short
-                        
-                        # 3. The 3 Portfolio State Variables
                         obs[28] = float(np.clip(equity / self.initial_balance, 0.0, 10.0))
                         obs[29] = float(np.clip((high_water_mark - equity) / high_water_mark, 0.0, 1.0))
                         obs[30] = float(np.clip(bars_since_last_trade / 480.0, 0.0, 1.0))
@@ -440,7 +422,6 @@ class M1HighFidelitySimulator:
                     latency_ms = (end_time - start_time) * 1000
                     latency_logs.append(latency_ms)
 
-        # Print Final Report
         journal_df = pd.DataFrame(journal)
         print("\n" + "=" * 50)
         print(" M1 ULTRA-FIDELITY SIMULATION REPORT (V3.2) ")
