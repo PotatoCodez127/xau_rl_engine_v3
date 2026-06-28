@@ -20,11 +20,11 @@ class HighFidelitySimulator:
         self.pip_value_per_lot = 10.0
 
         # --- NEW: Dynamic Compounding ---
-        self.risk_pct = 0.015  # Risking exactly 1.5% of current equity per trade
-        self.initial_balance = 10000.0
+        self.risk_pct = 0.01  # Risking exactly 1.5% of current equity per trade
+        self.initial_balance = 100.0
 
         # System Constants (Aligned with xau_dynamic_env.py)
-        self.min_bars_between_trades = 96  # Max 1 trade per day
+        self.min_bars_between_trades = 48  # Max 2 trade per day
 
         # Load AI Models
         self._load_models(oracle_path, manager_path)
@@ -202,13 +202,25 @@ class HighFidelitySimulator:
                 
                 # 5. Volatility Regime Modulation
                 # Throttle sizing by up to 25% during violent H1 volatility percentiles (protect against macro sweeps)
+                # regime_scalar = 1.0 - (pending_signal["h1_vol_regime"] * 0.25)
+                
+                # final_risk_pct = half_kelly * regime_scalar
+                
+                # # Ceiling at 5% to prevent catastrophic failure on model hallucination
+                # final_risk_pct = np.clip(final_risk_pct, 0.001, 0.05)
+                
+                # current_risk_usd = equity * final_risk_pct
+
+                # 1. Volatility Regime Modulation
                 regime_scalar = 1.0 - (pending_signal["h1_vol_regime"] * 0.25)
-                
-                final_risk_pct = half_kelly * regime_scalar
-                
-                # Ceiling at 5% to prevent catastrophic failure on model hallucination
+
+                # 2. Apply Fixed Risk
+                target_risk_pct = 0.01
+                final_risk_pct = target_risk_pct * regime_scalar
+
+                # Ceiling at 5% to prevent catastrophic failure
                 final_risk_pct = np.clip(final_risk_pct, 0.001, 0.05)
-                
+
                 current_risk_usd = equity * final_risk_pct
 
                 # Lot_Volume = Current_Risk_USD / (SL_Pips * Pip_Value)

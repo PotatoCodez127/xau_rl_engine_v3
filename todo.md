@@ -1,0 +1,1 @@
+make no trade period shorter aswell, and add daily limits.
