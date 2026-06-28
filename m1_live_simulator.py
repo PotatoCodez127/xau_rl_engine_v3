@@ -407,13 +407,22 @@ class M1HighFidelitySimulator:
                     if direction != 0 and bars_since_last_trade < self.min_bars_between_trades:
                         direction = 0
 
-                    # Phase B: Manager (Strict 28-value dimension established in Walk-Forward)
+                    # Phase B: Manager (Strict 31-value dimension established in Walk-Forward)
                     if direction != 0:
-                        obs = np.zeros(28, dtype=np.float32)
+                        obs = np.zeros(31, dtype=np.float32)
+                        
+                        # 1. The 25 Market Features
                         obs[:25] = feature_vector
+                        
+                        # 2. The 3 Oracle Probabilities
                         obs[25] = prob_hold
                         obs[26] = prob_long
                         obs[27] = prob_short
+                        
+                        # 3. The 3 Portfolio State Variables
+                        obs[28] = float(np.clip(equity / self.initial_balance, 0.0, 10.0))
+                        obs[29] = float(np.clip((high_water_mark - equity) / high_water_mark, 0.0, 1.0))
+                        obs[30] = float(np.clip(bars_since_last_trade / 480.0, 0.0, 1.0))
                         
                         action, _ = self.manager.predict(obs, deterministic=True)
                         size_val, tp_val, sl_val = action[1], action[2], action[3]
