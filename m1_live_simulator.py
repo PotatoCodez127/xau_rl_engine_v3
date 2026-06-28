@@ -37,7 +37,7 @@ class DualM1DataFeed:
 
 
 class StreamingFeatureEngine:
-    """Stateful feature builder supporting cross-asset correlation."""
+    """Stateful feature builder supporting full multi-timeframe zone logic."""
     def __init__(self, window_size=1000):
         self.history_limit = window_size 
         self.m1_buffer = []
@@ -46,8 +46,6 @@ class StreamingFeatureEngine:
 
     def process_m1_tick(self, timestamp, tick_row):
         self.m1_buffer.append(tick_row)
-        
-        # Close 15m candle on the 00, 15, 30, 45 minute marks
         if timestamp.minute % 15 == 0 and len(self.m1_buffer) > 0:
             features = self._close_15m_candle(timestamp)
             self.m1_buffer = [] 
@@ -56,14 +54,12 @@ class StreamingFeatureEngine:
 
     def _close_15m_candle(self, timestamp):
         m1_df = pd.DataFrame(self.m1_buffer)
-        
-        # Synthesize XAU 15m Bar
         new_15m = pd.DataFrame({
             "open": [m1_df["xau_open"].iloc[0]],
             "high": [m1_df["xau_high"].max()],
             "low": [m1_df["xau_low"].min()],
             "close": [m1_df["xau_close"].iloc[-1]],
-            "dxy_close": [m1_df["dxy_close"].iloc[-1]] # Capture DXY close for correlation
+            "dxy_close": [m1_df["dxy_close"].iloc[-1]] 
         }, index=[timestamp])
 
         self.m15_history = pd.concat([self.m15_history, new_15m])
@@ -79,7 +75,7 @@ class StreamingFeatureEngine:
     def _calculate_current_features(self):
         df = self.m15_history.copy()
         
-        # 1. Standard Price Features (ATR, Trend, Volatility)
+        # --- 1. Base Variables ---
         high_low = df["high"] - df["low"]
         high_close = np.abs(df["high"] - df["close"].shift())
         low_close = np.abs(df["low"] - df["close"].shift())
@@ -92,17 +88,87 @@ class StreamingFeatureEngine:
         h1_high = df["high"].rolling(window=4).max()
         h1_low = df["low"].rolling(window=4).min()
         df["h1_vol_regime"] = (h1_high - h1_low).rolling(window=96).rank(pct=True)
-        
-        # 2. Fractional Differentiation
+
         weights = self._get_fractional_weights(0.45, 50)
         last_50_close = df["close"].iloc[-50:].values
         df.loc[df.index[-1], "close_frac_diff"] = np.dot(last_50_close, weights)[0]
 
-        # 3. INTERMARKET CORRELATION (DXY)
-        # Replicating step 4 from build_features.py exactly
+        df["mom_1_norm"] = (df["close"] - df["close"].shift(1)) / df["env_atr"]
+        df["mom_4_norm"] = (df["close"] - df["close"].shift(4)) / df["env_atr"]
         df["dxy_pct_change_15m"] = df["dxy_close"].pct_change()
 
-        # Needs to return the final assembled dictionary exactly matching the Oracle's expected inputs
+        # --- 2. Multi-Timeframe Wick Zones & Levels ---
+        # 15m Zones
+        df["ema_50"] = df["close"].ewm(span=50, adjust=False).mean()
+        df["rolling_max_15m"] = df["high"].rolling(window=11, center=False).max()
+        df["rolling_min_15m"] = df["low"].rolling(window=11, center=False).min()
+        is_swing_high = df["high"].shift(5) == df["rolling_max_15m"]
+        is_swing_low = df["low"].shift(5) == df["rolling_min_15m"]
+        for col in ["res_zone_top_15m", "res_zone_bottom_15m", "sup_zone_top_15m", "sup_zone_bottom_15m"]:
+            df[col] = np.nan
+        df.loc[is_swing_high, "res_zone_top_15m"] = df["high"].shift(5)
+        df.loc[is_swing_high, "res_zone_bottom_15m"] = df[["open", "close"]].shift(5).max(axis=1)
+        df.loc[is_swing_low, "sup_zone_bottom_15m"] = df["low"].shift(5)
+        df.loc[is_swing_low, "sup_zone_top_15m"] = df[["open", "close"]].shift(5).min(axis=1)
+        for col in ["res_zone_top_15m", "res_zone_bottom_15m", "sup_zone_top_15m", "sup_zone_bottom_15m"]:
+            df[col] = df[col].ffill()
+
+        # 30m Zones
+        df_30m = df.resample("30min").agg({"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
+        df_30m["rolling_max"] = df_30m["high"].rolling(window=11, center=False).max()
+        df_30m["rolling_min"] = df_30m["low"].rolling(window=11, center=False).min()
+        sh_30 = df_30m["high"].shift(5) == df_30m["rolling_max"]
+        sl_30 = df_30m["low"].shift(5) == df_30m["rolling_min"]
+        for col in ["res_zone_top_30m", "res_zone_bottom_30m", "sup_zone_top_30m", "sup_zone_bottom_30m"]:
+            df_30m[col] = np.nan
+        df_30m.loc[sh_30, "res_zone_top_30m"] = df_30m["high"].shift(5)
+        df_30m.loc[sh_30, "res_zone_bottom_30m"] = df_30m[["open", "close"]].shift(5).max(axis=1)
+        df_30m.loc[sl_30, "sup_zone_bottom_30m"] = df_30m["low"].shift(5)
+        df_30m.loc[sl_30, "sup_zone_top_30m"] = df_30m[["open", "close"]].shift(5).min(axis=1)
+        for col in ["res_zone_top_30m", "res_zone_bottom_30m", "sup_zone_top_30m", "sup_zone_bottom_30m"]:
+            df_30m[col] = df_30m[col].ffill()
+
+        # 4H Zones
+        df_4h = df.resample("4h").agg({"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
+        df_4h["rolling_max"] = df_4h["high"].rolling(window=11, center=False).max()
+        df_4h["rolling_min"] = df_4h["low"].rolling(window=11, center=False).min()
+        sh_4h = df_4h["high"].shift(5) == df_4h["rolling_max"]
+        sl_4h = df_4h["low"].shift(5) == df_4h["rolling_min"]
+        for col in ["res_zone_top_4h", "res_zone_bottom_4h", "sup_zone_top_4h", "sup_zone_bottom_4h"]:
+            df_4h[col] = np.nan
+        df_4h.loc[sh_4h, "res_zone_top_4h"] = df_4h["high"].shift(5)
+        df_4h.loc[sh_4h, "res_zone_bottom_4h"] = df_4h[["open", "close"]].shift(5).max(axis=1)
+        df_4h.loc[sl_4h, "sup_zone_bottom_4h"] = df_4h["low"].shift(5)
+        df_4h.loc[sl_4h, "sup_zone_top_4h"] = df_4h[["open", "close"]].shift(5).min(axis=1)
+        for col in ["res_zone_top_4h", "res_zone_bottom_4h", "sup_zone_top_4h", "sup_zone_bottom_4h"]:
+            df_4h[col] = df_4h[col].ffill()
+
+        # Daily Levels
+        daily = df.resample("D").agg({"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
+        daily["prev_high"] = daily["high"].shift(1)
+        daily["prev_low"] = daily["low"].shift(1)
+        daily["prev_close"] = daily["close"].shift(1)
+        daily["daily_eq"] = (daily["prev_high"] + daily["prev_low"]) / 2.0
+        daily["pivot"] = (daily["prev_high"] + daily["prev_low"] + daily["prev_close"]) / 3.0
+        daily["R1"] = (2 * daily["pivot"]) - daily["prev_low"]
+        daily["S1"] = (2 * daily["pivot"]) - daily["prev_high"]
+
+        # Merge
+        df = pd.merge_asof(df, df_30m[["res_zone_top_30m", "res_zone_bottom_30m", "sup_zone_top_30m", "sup_zone_bottom_30m"]], left_index=True, right_index=True)
+        df = pd.merge_asof(df, df_4h[["res_zone_top_4h", "res_zone_bottom_4h", "sup_zone_top_4h", "sup_zone_bottom_4h"]], left_index=True, right_index=True)
+        df = pd.merge_asof(df, daily[["daily_eq", "pivot", "R1", "S1"]], left_index=True, right_index=True)
+
+        # --- 3. Distance Normalization ---
+        price_level_cols = [
+            "ema_50", "rolling_max_15m", "rolling_min_15m",
+            "res_zone_top_15m", "res_zone_bottom_15m", "sup_zone_top_15m", "sup_zone_bottom_15m",
+            "res_zone_top_30m", "res_zone_bottom_30m", "sup_zone_top_30m", "sup_zone_bottom_30m",
+            "res_zone_top_4h", "res_zone_bottom_4h", "sup_zone_top_4h", "sup_zone_bottom_4h",
+            "daily_eq", "pivot", "R1", "S1"
+        ]
+        for col in price_level_cols:
+            df[f"dist_{col}_norm"] = (df[col] - df["close"]) / df["env_atr"]
+
         return df.iloc[-1].to_dict()
 
     def _get_fractional_weights(self, d: float, size: int) -> np.ndarray:
@@ -139,11 +205,14 @@ class M1HighFidelitySimulator:
         self._load_models(oracle_path, manager_path)
 
     def _load_models(self, oracle_path, manager_path):
-        # We need the feature column order exactly as the Oracle expects it
+        # Explicit 25-Dimension Mapping required by PyTorch Model
         self.feature_cols = [
-            "env_open", "env_high", "env_low", "env_close", "env_atr", 
-            "h4_trend", "h1_vol_regime", "close_frac_diff", "dxy_pct_change_15m"
-            # Add any other zone distance columns from build_features.py here
+            "h4_trend", "h1_vol_regime", "close_frac_diff", "mom_1_norm", "mom_4_norm", "dxy_pct_change_15m",
+            "dist_ema_50_norm", "dist_rolling_max_15m_norm", "dist_rolling_min_15m_norm",
+            "dist_res_zone_top_15m_norm", "dist_res_zone_bottom_15m_norm", "dist_sup_zone_top_15m_norm", "dist_sup_zone_bottom_15m_norm",
+            "dist_res_zone_top_30m_norm", "dist_res_zone_bottom_30m_norm", "dist_sup_zone_top_30m_norm", "dist_sup_zone_bottom_30m_norm",
+            "dist_res_zone_top_4h_norm", "dist_res_zone_bottom_4h_norm", "dist_sup_zone_top_4h_norm", "dist_sup_zone_bottom_4h_norm",
+            "dist_daily_eq_norm", "dist_pivot_norm", "dist_R1_norm", "dist_S1_norm"
         ]
 
         self.oracle = TemporalAttentionOracle(
@@ -153,6 +222,10 @@ class M1HighFidelitySimulator:
         self.oracle.eval()
 
         self.manager = SAC.load(manager_path, device=self.device)
+        
+        # Initialize the 30-period sliding window required by the Oracle
+        from collections import deque
+        self.feature_buffer = deque(maxlen=30)
 
     def is_restricted_time(self, current_time: pd.Timestamp) -> bool:
         if (current_time.hour == 23 and current_time.minute >= 45) or (
@@ -301,33 +374,62 @@ class M1HighFidelitySimulator:
             if latest_15m_features is not None:
                 bars_since_last_trade += 1
                 
+                # Append to sliding window safely, filling NaNs (common during warm-up) with 0.0
+                feature_vector = [latest_15m_features.get(c, 0.0) if not np.isnan(latest_15m_features.get(c, 0.0)) else 0.0 for c in self.feature_cols]
+                self.feature_buffer.append(feature_vector)
+                
                 if trading_locked_for_day or self.is_restricted_time(timestamp):
                     continue
 
-                # ==========================================
-                # LATENCY PROFILER START
-                # ==========================================
-                start_time = time.perf_counter()
+                # Execute Inference ONLY if buffer is full
+                if len(self.feature_buffer) == 30:
+                    start_time = time.perf_counter()
 
-                # Extract proper order
-                feature_vector = [latest_15m_features.get(c, 0.0) for c in self.feature_cols]
-                
-                # (Assuming the Oracle buffer handling is standard, you will append this 
-                # new row to a rolling 30-period Tensor here)
-                
-                # Dummy Inference Time
-                # logits = self.oracle(window_tensor)
-                # action, _ = self.manager.predict(obs, deterministic=True)
+                    # Phase A: Oracle
+                    window_tensor = torch.FloatTensor(np.array(self.feature_buffer)).unsqueeze(0).to(self.device)
+                    with torch.no_grad():
+                        logits = self.oracle(window_tensor)
+                        probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
+                    prob_hold, prob_long, prob_short = probs[0], probs[1], probs[2]
 
-                end_time = time.perf_counter()
-                latency_ms = (end_time - start_time) * 1000
-                latency_logs.append(latency_ms)
-                # ==========================================
-                # LATENCY PROFILER END
-                # ==========================================
+                    # Gating execution logic
+                    EXECUTION_THRESHOLD = 0.35
+                    current_h4_trend = latest_15m_features.get("h4_trend", 0)
+                    direction = 0
 
-                # Example Trigger Logic (To be populated with your exact Oracle/Manager call)
-                # pending_signal = { "type": "Long", "sl_distance": 20.0, "tp_distance": 40.0 }
+                    if prob_long > EXECUTION_THRESHOLD and prob_long > prob_short:
+                        if current_h4_trend > 0:
+                            direction = 1
+                    elif prob_short > EXECUTION_THRESHOLD and prob_short > prob_long:
+                        if current_h4_trend < 0:
+                            direction = 2
+
+                    if direction != 0 and bars_since_last_trade < self.min_bars_between_trades:
+                        direction = 0
+
+                    # Phase B: Manager (Strict 28-value dimension established in Walk-Forward)
+                    if direction != 0:
+                        obs = np.zeros(28, dtype=np.float32)
+                        obs[:25] = feature_vector
+                        obs[25] = prob_hold
+                        obs[26] = prob_long
+                        obs[27] = prob_short
+                        
+                        action, _ = self.manager.predict(obs, deterministic=True)
+                        size_val, tp_val, sl_val = action[1], action[2], action[3]
+                        
+                        sl_mult = ((sl_val + 1.0) / 2.0) * 1.0 + 0.5
+                        tp_mult = sl_mult * (((tp_val + 1.0) / 2.0) * 2.0 + 1.0)
+                        
+                        pending_signal = {
+                            "type": "Long" if direction == 1 else "Short",
+                            "sl_distance": (latest_15m_features.get("env_atr", 1.0) * sl_mult) * 10,
+                            "tp_distance": (latest_15m_features.get("env_atr", 1.0) * tp_mult) * 10
+                        }
+
+                    end_time = time.perf_counter()
+                    latency_ms = (end_time - start_time) * 1000
+                    latency_logs.append(latency_ms)
 
         # Print Final Report
         journal_df = pd.DataFrame(journal)
