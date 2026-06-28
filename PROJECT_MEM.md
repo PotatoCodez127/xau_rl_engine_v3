@@ -151,3 +151,11 @@ To reduce execution frequency to a realistic retail range (1–2 trades/day) and
 * **Objective:** Transition from fixed 1.5% volumetric compounding to dynamic, mathematical sizing without triggering neural network retraining.
 * **Implementation:** Deployed a discrete step-function in `live_simulator.py`. Risk sizing is now calculated continuously using the Kelly Criterion ($p - (1-p)/b$) driven by a blend of the Phase A Oracle's real-time confidence and the WFA OOS historical winrate.
 * **Protection Mechanisms:** The raw fraction is halved (Half-Kelly) and modulated inversely by the `h1_vol_regime` (throttling risk by up to 25% during macro sweeps). The output is rigidly quantized to MetaTrader 5 FIX API compliance (0.01 lot increments).
+
+## 30. Prop Firm Execution Refactoring (Survival Optimization)
+* **Objective:** Transition from continuous alpha generation to strict proprietary firm rule compliance (5% Max Drawdown, 3% Daily Drawdown, 15% Consistency, 5% Profit Cap) without retraining the V3.2 neural weights.
+* **Architecture Update (Execution Layer):** * Deprecated the `Regime-Modulated Half-Kelly` sizing in favor of a fixed fractional risk model strictly capped at $20 per trade to survive prolonged statistical drawdown sequences.
+  * Implemented an Asymmetric Consistency Clip, physically unbinding the SAC Manager's Take Profit and forcing liquidation at exactly +$37.50 to satisfy the firm's 15% consistency limit.
+  * Integrated Global Circuit Breakers to freeze execution if daily drawdown hits -$150 or if overall trailing drawdown hits -$250.
+  * Removed Friday weekend liquidation barriers, allowing the Distributional SAC to hold swing positions over the weekend. 
+* **Current State:** The ML Oracle and SAC Manager retain their mathematical edge, but their outputs are heavily heavily throttled by the broker-side API script to guarantee survival constraints.
