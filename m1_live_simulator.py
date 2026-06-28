@@ -9,7 +9,7 @@ from models.oracle.attention_net import TemporalAttentionOracle
 
 class DualM1DataFeed:
     """Mimics a live MT5 terminal receiving ticks from multiple symbols simultaneously."""
-    def __init__(self, xau_m1_path, dxy_m1_path, slice_data=True):
+    def __init__(self, xau_m1_path, dxy_m1_path):
         print("Initializing Synchronized Dual-Stream M1 Feed...")
         
         xau_df = self._parse_mt_csv(xau_m1_path).add_prefix("xau_")
@@ -17,13 +17,29 @@ class DualM1DataFeed:
         
         self.master_stream = xau_df.join(dxy_df, how="inner")
         
-        if slice_data:
-            # Keep only the last 25% of the data (5% for warm-up, 20% for testing)
-            slice_idx = int(len(self.master_stream) * 0.6)
-            self.master_stream = self.master_stream.iloc[slice_idx:]
-            print(f"Dataset pre-sliced. Starting simulation at tick index {slice_idx}")
-            
-        print(f"Dual-Stream synchronized. Total ticks to process: {len(self.master_stream)}")
+        # --- THE FIX: PRE-SLICE THE DATA ---
+        total_data = len(self.master_stream)
+        oos_size = int(total_data * 0.20)  # We only want to test on the last 20%
+        warmup_buffer = 3000               # 3000 ticks is plenty for the 800-period 15m EMA
+        
+        start_index = max(0, total_data - oos_size - warmup_buffer)
+        self.master_stream = self.master_stream.iloc[start_index:]
+        
+        print(f"Dataset pre-sliced. Bypassing 1.5M in-sample ticks.")
+        print(f"Total ticks to process (Warmup + OOS): {len(self.master_stream)}")
+
+    def _parse_mt_csv(self, filepath):
+        separator = "\t" if len(pd.read_csv(filepath, nrows=1, sep="\t").columns) > 1 else ","
+        df = pd.read_csv(filepath, sep=separator)
+        df.columns = [c.strip("<>").lower() for c in df.columns]
+        df["datetime"] = pd.to_datetime(df["date"] + " " + df["time"], format="%Y.%m.%d %H:%M:%S")
+        df.set_index("datetime", inplace=True)
+        return df[["open", "high", "low", "close"]] 
+
+    def stream(self):
+        """Yields one synchronized row of XAU and DXY data at a time."""
+        for timestamp, row in self.master_stream.iterrows():
+            yield timestamp, row
 
     def _parse_mt_csv(self, filepath):
         separator = "\t" if len(pd.read_csv(filepath, nrows=1, sep="\t").columns) > 1 else ","
@@ -231,6 +247,8 @@ class M1HighFidelitySimulator:
     def run_simulation(self):
         total_ticks = len(self.feed.master_stream)
         holdout_start_idx = int(total_ticks * 0.8)
+        
+        holdout_start_idx = 3000 
         
         print(f"Executing Sequential Challenge Yield Tester...")
         print(f"Enforcing OOS Firewall at Index: {holdout_start_idx}")
