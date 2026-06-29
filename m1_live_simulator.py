@@ -41,20 +41,6 @@ class DualM1DataFeed:
         for timestamp, row in self.master_stream.iterrows():
             yield timestamp, row
 
-    def _parse_mt_csv(self, filepath):
-        separator = "\t" if len(pd.read_csv(filepath, nrows=1, sep="\t").columns) > 1 else ","
-        df = pd.read_csv(filepath, sep=separator)
-        df.columns = [c.strip("<>").lower() for c in df.columns]
-        df["datetime"] = pd.to_datetime(df["date"] + " " + df["time"], format="%Y.%m.%d %H:%M:%S")
-        df.set_index("datetime", inplace=True)
-        return df[["open", "high", "low", "close"]] 
-
-    def stream(self):
-        """Yields one synchronized row of XAU and DXY data at a time."""
-        for timestamp, row in self.master_stream.iterrows():
-            yield timestamp, row
-
-
 class StreamingFeatureEngine:
     """Stateful feature builder supporting full multi-timeframe zone logic."""
     def __init__(self, window_size=1000):
@@ -212,7 +198,10 @@ class M1HighFidelitySimulator:
         self.max_daily_loss = 150.00
         self.max_trailing_loss = 250.00
         self.profit_target = 5250.00
-        self.min_bars_between_trades = 96 
+        
+        # New trade pacing limits
+        self.max_trades_per_day = 5
+        self.min_bars_between_trades = 4
 
         self._load_models(oracle_path, manager_path)
 
@@ -246,8 +235,8 @@ class M1HighFidelitySimulator:
 
     def run_simulation(self):
         total_ticks = len(self.feed.master_stream)
-        holdout_start_idx = int(total_ticks * 0.8)
         
+        # Since Data is pre-sliced, we use the warmup buffer index
         holdout_start_idx = 3000 
         
         print(f"Executing Sequential Challenge Yield Tester...")
@@ -260,6 +249,7 @@ class M1HighFidelitySimulator:
         current_day = None
         
         trading_locked_for_day = False
+        trades_today = 0
         
         # Challenge Yield Trackers
         challenge_history = []
@@ -278,6 +268,7 @@ class M1HighFidelitySimulator:
               progress_pct = (idx / total_ticks) * 100
               status = "WARMUP (In-Sample)" if idx < holdout_start_idx else "ACTIVE (Out-of-Sample)"
               print(f"[{timestamp}] Progress: {progress_pct:.2f}% ({idx}/{total_ticks}) | Status: {status} | Equity: ${equity:.2f}")
+            
             # --- 1. STATEFUL FEATURE FEED (Warm-Up Mode) ---
             latest_15m_features = self.engine.process_m1_tick(timestamp, tick_row)
             if latest_15m_features is not None:
@@ -299,6 +290,7 @@ class M1HighFidelitySimulator:
                 daily_start_equity = equity
                 current_day = timestamp.date()
                 trading_locked_for_day = False
+                trades_today = 0 # Daily counter reset
 
             # --- 3. M1 TICK-LEVEL TRADE MANAGEMENT ---
             account_failed = False
@@ -397,6 +389,7 @@ class M1HighFidelitySimulator:
                 trading_locked_for_day = False
                 current_challenge_start_time = timestamp
                 trades_in_current_challenge = 0
+                trades_today = 0 # Daily counter reset
                 active_trade = None
                 pending_signal = None
                 continue # Skip the rest of this tick to start fresh on the next
@@ -421,6 +414,7 @@ class M1HighFidelitySimulator:
                     "total_friction": total_friction,
                 }
                 bars_since_last_trade = 0
+                trades_today += 1 # Execution recorded for daily limits
                 pending_signal = None
                 continue
 
@@ -451,8 +445,12 @@ class M1HighFidelitySimulator:
                         if current_h4_trend < 0:
                             direction = 2
 
-                    if direction != 0 and bars_since_last_trade < self.min_bars_between_trades:
-                        direction = 0
+                    # --- THE PROPER GATING FIX ---
+                    if direction != 0:
+                        if bars_since_last_trade < self.min_bars_between_trades:
+                            direction = 0  # Blocked by 1-hour cooldown
+                        elif trades_today >= self.max_trades_per_day:
+                            direction = 0  # Blocked by 5-trade daily limit
 
                     if direction != 0:
                         obs = np.zeros(31, dtype=np.float32)
