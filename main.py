@@ -8,79 +8,31 @@ import pandas as pd
 import MetaTrader5 as mt5
 from datetime import datetime, timezone, timedelta
 from collections import deque
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from stable_baselines3 import SAC
+from dotenv import load_dotenv # Add this import
 
 # Internal V3 Imports
 from m1_live_simulator import StreamingFeatureEngine
 from models.oracle.attention_net import TemporalAttentionOracle
+from wa_manager import WhatsAppCopilot
+
+load_dotenv()
 
 # --- CONFIGURATION ---
-WHATSAPP_API_URL = os.getenv("WHATSAPP_API_URL", "https://graph.facebook.com/v17.0/YOUR_PHONE_NUMBER_ID/messages")
+PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "PHONE_NUMBER_ID_NOT_SET")
+WHATSAPP_API_URL = os.getenv("WHATSAPP_API_URL", f"https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "YOUR_ACCESS_TOKEN")
 HEADERS = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
 
 ORACLE_WEIGHTS = "models/oracle/best_oracle.pth"
 MANAGER_WEIGHTS = "models/manager/saved/wfa_43/best_model.zip"  # Update to latest WFA split
 
+app = FastAPI(title="XAU Quant Copilot - Live Engine")
+wa_manager = WhatsAppCopilot()
+print(f"[DEBUG] WhatsAppCopilot loaded from: {wa_manager.__class__.__module__}") # Add this
+
 # --- CORE SYSTEMS ---
-
-class WhatsAppCopilot:
-    """Manages the 24-hour interaction window and broadcast logic for live signals."""
-    def __init__(self):
-        self.subscribers = {}  # Format: { "phone_number": "last_interaction_utc_timestamp" }
-        self.window_limit = timedelta(hours=24)
-        self.reminder_threshold = timedelta(hours=23, minutes=30)
-
-    def update_interaction(self, phone_number: str):
-        """Called via FastAPI webhook when a user sends a message, refreshing the 24h window."""
-        self.subscribers[phone_number] = datetime.now(timezone.utc)
-        print(f"[WhatsApp] Window refreshed for {phone_number}. Valid for 24h.")
-        self._send_message(phone_number, "System Synced. You are actively receiving XAU Live Signals.")
-
-    def broadcast_signal(self, signal_data: dict):
-        """Sends the generated trade matrix to all users within the open window."""
-        now = datetime.now(timezone.utc)
-        active_users = [
-            num for num, last_time in self.subscribers.items()
-            if now - last_time < self.window_limit
-        ]
-
-        message_body = (
-            f"⚜️ XAU_RL_V3 LIVE SIGNAL ⚜️\n\n"
-            f"Action: {signal_data['type']}\n"
-            f"Entry: {signal_data['entry']:.3f}\n"
-            f"Stop Loss: {signal_data['sl']:.3f}\n"
-            f"Take Profit: {signal_data['tp']:.3f}\n\n"
-            f"Calculated Risk: {signal_data['risk_profile']}"
-        )
-
-        for user in active_users:
-            self._send_message(user, message_body)
-            print(f"[WhatsApp] Signal dispatched to {user}")
-
-    def check_and_send_reminders(self):
-        """Warns users their receiving window is about to mathematically expire."""
-        now = datetime.now(timezone.utc)
-        for num, last_time in self.subscribers.items():
-            elapsed = now - last_time
-            if self.reminder_threshold <= elapsed < self.window_limit:
-                reminder = "⚠️ Your signal window is closing in less than 30 minutes! Reply 'SYNC' to keep the live feed open."
-                self._send_message(num, reminder)
-                print(f"[WhatsApp] Reminder dispatched to {num}")
-
-    def _send_message(self, to_number: str, text: str):
-        payload = {
-            "messaging_product": "whatsapp",
-            "to": to_number,
-            "type": "text",
-            "text": {"body": text}
-        }
-        try:
-            requests.post(WHATSAPP_API_URL, headers=HEADERS, json=payload)
-        except Exception as e:
-            print(f"[WhatsApp] Failed to send message: {e}")
-
 
 class LiveMT5Feed:
     """Asynchronous background connector to the open MT5 terminal."""
@@ -111,9 +63,6 @@ class LiveMT5Feed:
         return timestamp, tick_row
 
 
-# --- FASTAPI APP INITIALIZATION ---
-app = FastAPI(title="XAU Quant Copilot - Live Engine")
-wa_manager = WhatsAppCopilot()
 feed = LiveMT5Feed()
 feature_engine = StreamingFeatureEngine(window_size=1000)
 
@@ -142,6 +91,16 @@ else:
     manager = None
     print("⚠️ Warning: SAC Manager weights not found. Signals will not trigger.")
 
+@app.get("/webhook")
+async def verify_webhook(request: Request):
+    """Handles the initial Meta webhook verification handshake."""
+    mode = request.query_params.get("hub.mode")
+    token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
+
+    if mode == "subscribe" and token == os.getenv("VERIFY_TOKEN"):
+        return int(challenge)
+    return Response(status_code=403)
 
 @app.post("/webhook")
 async def whatsapp_webhook(request: Request):
@@ -151,11 +110,9 @@ async def whatsapp_webhook(request: Request):
         messages = data.get('entry', [{}])[0].get('changes', [{}])[0].get('value', {}).get('messages', [])
         if messages:
             phone_number = messages[0].get('from')
-            # The client sent a message, refreshing the 24h gatekeeper window
             wa_manager.update_interaction(phone_number)
     except Exception as e:
         print(f"[Webhook Error] Malformed payload: {e}")
-        
     return {"status": "ok"}
 
 
