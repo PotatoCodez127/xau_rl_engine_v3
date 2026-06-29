@@ -501,6 +501,8 @@ class M1HighFidelitySimulator:
             print("No challenges completed. The OOS period may be too short, or no trades were taken.")
             
         print("=" * 60)
+        
+        return yield_df
 
 if __name__ == "__main__":
     XAU = "data/raw/XAUUSDr_M1.csv"
