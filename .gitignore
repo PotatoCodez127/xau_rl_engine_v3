@@ -16,3 +16,4 @@ training_state.json
 models/manager/saved
 tests/
 .env
+subscribers.json
