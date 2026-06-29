@@ -151,3 +151,19 @@ To reduce execution frequency to a realistic retail range (1–2 trades/day) and
 * **Objective:** Transition from fixed 1.5% volumetric compounding to dynamic, mathematical sizing without triggering neural network retraining.
 * **Implementation:** Deployed a discrete step-function in `live_simulator.py`. Risk sizing is now calculated continuously using the Kelly Criterion ($p - (1-p)/b$) driven by a blend of the Phase A Oracle's real-time confidence and the WFA OOS historical winrate.
 * **Protection Mechanisms:** The raw fraction is halved (Half-Kelly) and modulated inversely by the `h1_vol_regime` (throttling risk by up to 25% during macro sweeps). The output is rigidly quantized to MetaTrader 5 FIX API compliance (0.01 lot increments).
+
+## 30. Prop Firm Execution Refactoring (Survival Optimization)
+* **Objective:** Transition from continuous alpha generation to strict proprietary firm rule compliance (5% Max Drawdown, 3% Daily Drawdown, 15% Consistency, 5% Profit Cap) without retraining the V3.2 neural weights.
+* **Architecture Update (Execution Layer):** * Deprecated the `Regime-Modulated Half-Kelly` sizing in favor of a fixed fractional risk model strictly capped at $20 per trade to survive prolonged statistical drawdown sequences.
+  * Implemented an Asymmetric Consistency Clip, physically unbinding the SAC Manager's Take Profit and forcing liquidation at exactly +$37.50 to satisfy the firm's 15% consistency limit.
+  * Integrated Global Circuit Breakers to freeze execution if daily drawdown hits -$150 or if overall trailing drawdown hits -$250.
+  * Removed Friday weekend liquidation barriers, allowing the Distributional SAC to hold swing positions over the weekend. 
+* **Current State:** The ML Oracle and SAC Manager retain their mathematical edge, but their outputs are heavily heavily throttled by the broker-side API script to guarantee survival constraints.
+
+## 31. Live Deployment Architecture: Ultra-Fidelity M1 Event Engine
+* **Objective:** Completely eradicate the "15-minute Slippage" artifact that caused Consistency Rule violations and bridge the theoretical simulator to a live MetaTrader 5 FIX API structure.
+* **Architecture Update:**
+  * **Synchronized Dual-Stream Data Feed:** Transitioned from pre-processed Pandas dataframes to a stateful `DualM1DataFeed` that ingests XAUUSD and DXY tick data concurrently.
+  * **Stateful Feature Synthesis:** Built a streaming feature engine that silently maintains rolling window history (up to the 800-period H4 trend EMA) and synthesizes 15m OHLCV and Fractional Differentiation vectors dynamically at the `OnBarClose` event.
+  * **Tick-Level Trailing Logic:** PnL evaluations and Prop Firm Circuit Breakers (Guardian Shield, Consistency Cap) are now evaluated sequentially on M1 ticks, guaranteeing exact $37.50 liquidations without gap oversights.
+  * **Execution Latency Profiling:** Integrated a nanosecond perf-counter (`time.perf_counter()`) encompassing the feature synthesis and PyTorch/SB3 inference stack to mathematically verify real-world execution speeds before API deployment.

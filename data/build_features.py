@@ -324,7 +324,7 @@ class FeatureEngineer:
 
 
 if __name__ == "__main__":
-    XAU_PATH = "data/raw/XAUUSDr_M1_202306070100_202602202359.csv"
+    XAU_PATH = "data/raw/XAUUSDr_M1.csv"
     DXY_PATH = "data/raw/USDIndex_M1_202001020300_202606112359.csv"
     OUTPUT_PATH = "data/processed/labeled_features_15m.csv"
 
