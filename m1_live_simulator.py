@@ -19,7 +19,7 @@ class DualM1DataFeed:
         
         # --- PRE-SLICE THE DATA ---
         total_data = len(self.master_stream)
-        oos_size = int(total_data * 0.20)  # We only want to test on the last 20%
+        oos_size = int(total_data)  # We only want to test on the last 20%
         warmup_buffer = 3000               # 3000 ticks is plenty for the 800-period 15m EMA
         
         start_index = max(0, total_data - oos_size - warmup_buffer)
