@@ -59,7 +59,7 @@ logger.info(f"WhatsAppCopilot loaded from: {wa_manager.__class__.__module__}")
 # --- CORE SYSTEMS ---
 class LiveMT5Feed:
     """Asynchronous background connector to the open MT5 terminal."""
-    def __init__(self, xau_symbol="XAUUSD", dxy_symbol="DXY"):
+    def __init__(self, xau_symbol="XAUUSDr", dxy_symbol="USDIndex"):
         if not mt5.initialize():
             raise ConnectionError(f"MT5 Initialization failed: {mt5.last_error()}")
         self.xau = xau_symbol
@@ -240,7 +240,12 @@ async def live_trading_loop():
                     prob_hold, prob_long, prob_short = probs[0], probs[1], probs[2]
 
                     EXECUTION_THRESHOLD = 0.35
-                    current_h4_trend = latest_15m_features.get("h4_trend", 0)
+                    current_h4_trend = latest_15m_features.get("h4_trend", 0.0)
+                    env_atr = latest_15m_features.get("env_atr", 1.0)
+                    
+                    # --- 15-MINUTE NEURAL HEARTBEAT LOG ---
+                    logger.info(f"[{timestamp}] 📊 15m Closed | Trend (H4): {current_h4_trend:.4f} | ATR: {env_atr:.2f} | Probs -> H: {prob_hold:.3f} | L: {prob_long:.3f} | S: {prob_short:.3f}")
+
                     direction = 0
 
                     if prob_long > EXECUTION_THRESHOLD and prob_long > prob_short and current_h4_trend > 0:
@@ -272,7 +277,6 @@ async def live_trading_loop():
                         # De-normalize SL/TP metrics based on current environmental ATR
                         sl_mult = ((sl_val + 1.0) / 2.0) * 1.0 + 0.5
                         tp_mult = sl_mult * (((tp_val + 1.0) / 2.0) * 2.0 + 1.0)
-                        env_atr = latest_15m_features.get("env_atr", 1.0)
                         
                         entry_price = tick_row["xau_close"]
                         sl_distance = (env_atr * sl_mult)
