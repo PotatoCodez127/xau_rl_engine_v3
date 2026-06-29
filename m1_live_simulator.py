@@ -19,8 +19,8 @@ class DualM1DataFeed:
         
         # --- PRE-SLICE THE DATA ---
         total_data = len(self.master_stream)
-        oos_size = int(total_data)  # We only want to test on the last 20%
-        warmup_buffer = 3000               # 3000 ticks is plenty for the 800-period 15m EMA
+        oos_size = int(total_data)  
+        warmup_buffer = 3000               
         
         start_index = max(0, total_data - oos_size - warmup_buffer)
         self.master_stream = self.master_stream.iloc[start_index:]
@@ -81,6 +81,9 @@ class StreamingFeatureEngine:
         
         if len(self.m15_history) > self.history_limit:
             self.m15_history = self.m15_history.iloc[-self.history_limit:]
+            
+        # --- UPDATED WARMUP: Matches your new 200-period maximum lookback ---
+        if len(self.m15_history) >= 200:
             self.is_warmed_up = True
 
         if self.is_warmed_up:
@@ -96,8 +99,8 @@ class StreamingFeatureEngine:
         low_close = np.abs(df["low"] - df["close"].shift())
         df["env_atr"] = np.max(pd.concat([high_low, high_close, low_close], axis=1), axis=1).rolling(14).mean()
 
-        ema_50h = df["close"].ewm(span=200, adjust=False).mean()
-        ema_200h = df["close"].ewm(span=800, adjust=False).mean()
+        ema_50h = df["close"].ewm(span=50, adjust=False).mean()
+        ema_200h = df["close"].ewm(span=200, adjust=False).mean()
         df["h4_trend"] = (ema_50h - ema_200h) / ema_200h
 
         h1_high = df["high"].rolling(window=4).max()
@@ -209,8 +212,9 @@ class M1HighFidelitySimulator:
         self.max_trailing_loss = 250.00
         self.profit_target = 5250.00
         
-        self.max_trades_per_day = 5
-        self.min_bars_between_trades = 4
+        # --- THE FIX: Restore strict 1-trade-a-day architecture ---
+        self.max_trades_per_day = 1
+        self.min_bars_between_trades = 96 # 24-hour structural cooldown
 
         self._load_models(oracle_path, manager_path)
 
@@ -264,7 +268,7 @@ class M1HighFidelitySimulator:
         trades_in_current_challenge = 0
         
         journal = []
-        research_log = [] # <--- NEW DEEP RESEARCH TRACKER
+        research_log = [] 
         
         active_trade = None
         pending_signal = None
