@@ -17,7 +17,7 @@ class DualM1DataFeed:
         
         self.master_stream = xau_df.join(dxy_df, how="inner")
         
-        # --- THE FIX: PRE-SLICE THE DATA ---
+        # --- PRE-SLICE THE DATA ---
         total_data = len(self.master_stream)
         oos_size = int(total_data * 0.20)  # We only want to test on the last 20%
         warmup_buffer = 3000               # 3000 ticks is plenty for the 800-period 15m EMA
@@ -49,25 +49,18 @@ class StreamingFeatureEngine:
         self.m15_history = pd.DataFrame()
         self.is_warmed_up = False
         
-        # --- NEW GATEKEEPER ---
+        # --- HIGH-FREQUENCY GATEKEEPER ---
         self.last_closed_15m_mark = None 
 
     def process_m1_tick(self, timestamp, tick_row):
         self.m1_buffer.append(tick_row)
         
-        # In live mode, this condition evaluates to True ~240 times a minute.
         if timestamp.minute % 15 == 0 and len(self.m1_buffer) > 0:
-            
-            # Standardize the timestamp to the exact 15-minute boundary
-            # e.g., 15:00:23 becomes exactly 15:00:00
             current_15m_mark = timestamp.floor('15min')
             
-            # THE FIX: Only close the candle IF we haven't already closed this exact block
+            # Only calculate if we haven't already closed this 15m window
             if self.last_closed_15m_mark != current_15m_mark:
-                
-                # Pass the clean boundary timestamp to prevent microsecond mismatches
                 features = self._close_15m_candle(current_15m_mark)
-                
                 self.m1_buffer = [] 
                 self.last_closed_15m_mark = current_15m_mark
                 return features
@@ -216,7 +209,6 @@ class M1HighFidelitySimulator:
         self.max_trailing_loss = 250.00
         self.profit_target = 5250.00
         
-        # New trade pacing limits
         self.max_trades_per_day = 5
         self.min_bars_between_trades = 4
 
@@ -252,8 +244,6 @@ class M1HighFidelitySimulator:
 
     def run_simulation(self):
         total_ticks = len(self.feed.master_stream)
-        
-        # Since Data is pre-sliced, we use the warmup buffer index
         holdout_start_idx = 3000 
         
         print(f"Executing Sequential Challenge Yield Tester...")
@@ -268,12 +258,14 @@ class M1HighFidelitySimulator:
         trading_locked_for_day = False
         trades_today = 0
         
-        # Challenge Yield Trackers
+        # Trackers and Logs
         challenge_history = []
         current_challenge_start_time = None
         trades_in_current_challenge = 0
         
         journal = []
+        research_log = [] # <--- NEW DEEP RESEARCH TRACKER
+        
         active_trade = None
         pending_signal = None
         bars_since_last_trade = 0 
@@ -286,7 +278,7 @@ class M1HighFidelitySimulator:
               status = "WARMUP (In-Sample)" if idx < holdout_start_idx else "ACTIVE (Out-of-Sample)"
               print(f"[{timestamp}] Progress: {progress_pct:.2f}% ({idx}/{total_ticks}) | Status: {status} | Equity: ${equity:.2f}")
             
-            # --- 1. STATEFUL FEATURE FEED (Warm-Up Mode) ---
+            # --- 1. STATEFUL FEATURE FEED ---
             latest_15m_features = self.engine.process_m1_tick(timestamp, tick_row)
             if latest_15m_features is not None:
                 feature_vector = [latest_15m_features.get(c, 0.0) if not np.isnan(latest_15m_features.get(c, 0.0)) else 0.0 for c in self.feature_cols]
@@ -307,7 +299,7 @@ class M1HighFidelitySimulator:
                 daily_start_equity = equity
                 current_day = timestamp.date()
                 trading_locked_for_day = False
-                trades_today = 0 # Daily counter reset
+                trades_today = 0 
 
             # --- 3. M1 TICK-LEVEL TRADE MANAGEMENT ---
             account_failed = False
@@ -369,7 +361,10 @@ class M1HighFidelitySimulator:
                         "Type": active_trade["type"],
                         "Entry_Price": round(active_trade["entry"], 3),
                         "Exit_Price": round(exit_price, 3),
+                        "Lot_Size": round(active_trade["lot_size"], 2),
+                        "Friction_Cost": round(active_trade["total_friction"], 2),
                         "Net_PnL": round(net_pnl, 2),
+                        "Equity": round(equity, 2),
                         "Reason": exit_reason,
                     })
                     active_trade = None
@@ -399,17 +394,16 @@ class M1HighFidelitySimulator:
                     "Trades_Taken": trades_in_current_challenge
                 })
                 
-                # Instantly reset all tracking variables to buy a new challenge
                 equity = self.initial_balance
                 high_water_mark = self.initial_balance
                 daily_start_equity = self.initial_balance
                 trading_locked_for_day = False
                 current_challenge_start_time = timestamp
                 trades_in_current_challenge = 0
-                trades_today = 0 # Daily counter reset
+                trades_today = 0 
                 active_trade = None
                 pending_signal = None
-                continue # Skip the rest of this tick to start fresh on the next
+                continue 
 
             # --- 4. EXECUTE PENDING QUEUE ---
             if pending_signal is not None and active_trade is None:
@@ -431,7 +425,7 @@ class M1HighFidelitySimulator:
                     "total_friction": total_friction,
                 }
                 bars_since_last_trade = 0
-                trades_today += 1 # Execution recorded for daily limits
+                trades_today += 1 
                 pending_signal = None
                 continue
 
@@ -453,6 +447,7 @@ class M1HighFidelitySimulator:
 
                     EXECUTION_THRESHOLD = 0.35
                     current_h4_trend = latest_15m_features.get("h4_trend", 0)
+                    env_atr = latest_15m_features.get("env_atr", 1.0)
                     direction = 0
 
                     if prob_long > EXECUTION_THRESHOLD and prob_long > prob_short:
@@ -462,12 +457,26 @@ class M1HighFidelitySimulator:
                         if current_h4_trend < 0:
                             direction = 2
 
-                    # --- THE PROPER GATING FIX ---
                     if direction != 0:
                         if bars_since_last_trade < self.min_bars_between_trades:
-                            direction = 0  # Blocked by 1-hour cooldown
+                            direction = 0  
                         elif trades_today >= self.max_trades_per_day:
-                            direction = 0  # Blocked by 5-trade daily limit
+                            direction = 0  
+
+                    # --- DEEP RESEARCH CAPTURE ---
+                    research_record = {
+                        "Timestamp": timestamp,
+                        "Close_Price": tick_row["xau_close"],
+                        "H4_Trend": round(current_h4_trend, 4),
+                        "ATR": round(env_atr, 4),
+                        "Prob_Hold": round(prob_hold, 4),
+                        "Prob_Long": round(prob_long, 4),
+                        "Prob_Short": round(prob_short, 4),
+                        "Signal_Triggered": "None",
+                        "SAC_SL_Mult": 0.0,
+                        "SAC_TP_Mult": 0.0,
+                        "Equity_Ratio": round(equity / self.initial_balance, 3)
+                    }
 
                     if direction != 0:
                         obs = np.zeros(31, dtype=np.float32)
@@ -488,9 +497,17 @@ class M1HighFidelitySimulator:
                         
                         pending_signal = {
                             "type": "Long" if direction == 1 else "Short",
-                            "sl_distance": (latest_15m_features.get("env_atr", 1.0) * sl_mult) * 10,
-                            "tp_distance": (latest_15m_features.get("env_atr", 1.0) * tp_mult) * 10
+                            "sl_distance": (env_atr * sl_mult) * 10,
+                            "tp_distance": (env_atr * tp_mult) * 10
                         }
+                        
+                        # Update Research Record with Execution Intent
+                        research_record["Signal_Triggered"] = pending_signal["type"]
+                        research_record["SAC_SL_Mult"] = round(sl_mult, 3)
+                        research_record["SAC_TP_Mult"] = round(tp_mult, 3)
+
+                    # Append to matrix
+                    research_log.append(research_record)
 
                     end_time = time.perf_counter()
                     latency_ms = (end_time - start_time) * 1000
@@ -519,6 +536,16 @@ class M1HighFidelitySimulator:
             
         print("=" * 60)
         
+        # --- EXPORT LOGS ---
+        os.makedirs("logs", exist_ok=True)
+        if journal:
+            pd.DataFrame(journal).to_csv("logs/high_fidelity_journal.csv", index=False)
+            print("💾 Saved Trade Journal to: logs/high_fidelity_journal.csv")
+            
+        if research_log:
+            pd.DataFrame(research_log).to_csv("logs/neural_research_log.csv", index=False)
+            print("💾 Saved Neural Research Log to: logs/neural_research_log.csv")
+            
         return yield_df
 
 if __name__ == "__main__":
