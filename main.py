@@ -1,6 +1,8 @@
 import os
 import time
 import asyncio
+import logging
+import sys
 import requests
 import torch
 import numpy as np
@@ -19,6 +21,28 @@ from wa_manager import WhatsAppCopilot
 
 load_dotenv()
 
+# ==============================================================
+# 0. LOGGING CONFIGURATION (Dual-Tier: File + Console)
+# ==============================================================
+os.makedirs("logs", exist_ok=True)
+
+logger = logging.getLogger("XAU_Live_Engine")
+logger.setLevel(logging.INFO)
+
+# Format: [YYYY-MM-DD HH:MM:SS UTC] LEVEL: Message
+log_formatter = logging.Formatter('[%(asctime)s] %(levelname)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S UTC')
+
+# File Output
+file_handler = logging.FileHandler("logs/live_engine.log", encoding='utf-8')
+file_handler.setFormatter(log_formatter)
+
+# Console Output (Proof of Life)
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setFormatter(log_formatter)
+
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
+
 # --- CONFIGURATION ---
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "PHONE_NUMBER_ID_NOT_SET")
 WHATSAPP_API_URL = os.getenv("WHATSAPP_API_URL", f"https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages")
@@ -30,24 +54,24 @@ MANAGER_WEIGHTS = "models/manager/saved/wfa_43/best_model.zip"  # Update to late
 
 app = FastAPI(title="XAU Quant Copilot - Live Engine")
 wa_manager = WhatsAppCopilot()
-print(f"[DEBUG] WhatsAppCopilot loaded from: {wa_manager.__class__.__module__}")
+logger.info(f"WhatsAppCopilot loaded from: {wa_manager.__class__.__module__}")
 
 # --- CORE SYSTEMS ---
 class LiveMT5Feed:
     """Asynchronous background connector to the open MT5 terminal."""
-    def __init__(self, xau_symbol="XAUUSDr", dxy_symbol="USDIndex"):
+    def __init__(self, xau_symbol="XAUUSD", dxy_symbol="DXY"):
         if not mt5.initialize():
             raise ConnectionError(f"MT5 Initialization failed: {mt5.last_error()}")
         self.xau = xau_symbol
         self.dxy = dxy_symbol
-        print(f"[MT5] Terminal Connected. Streaming {self.xau} & {self.dxy}")
+        logger.info(f"[MT5] Terminal Connected. Streaming {self.xau} & {self.dxy}")
 
     def get_latest_tick(self):
         tick_xau = mt5.symbol_info_tick(self.xau)
         
         # --- MT5 DISCONNECT RESILIENCE ---
         if tick_xau is None:
-            print("[MT5] Connection lost. Attempting to re-initialize...")
+            logger.warning("[MT5] Connection lost. Attempting to re-initialize...")
             mt5.initialize()
             return None, None
             
@@ -69,7 +93,7 @@ class LiveMT5Feed:
 
     def fetch_historical_warmup(self, bars=15000):
         """Fetches the last N minutes of data to instantly saturate the engine's memory."""
-        print(f"[MT5] Fetching last {bars} M1 bars for Instant Warmup...")
+        logger.info(f"[MT5] Fetching last {bars} M1 bars for Instant Warmup...")
         
         rates_xau = mt5.copy_rates_from_pos(self.xau, mt5.TIMEFRAME_M1, 0, bars)
         rates_dxy = mt5.copy_rates_from_pos(self.dxy, mt5.TIMEFRAME_M1, 0, bars)
@@ -109,18 +133,18 @@ feature_cols = [
 ]
 
 # Load Neural Architecture
-print("[Neural Core] Loading Phase A (Temporal Attention Oracle)...")
+logger.info("[Neural Core] Loading Phase A (Temporal Attention Oracle)...")
 oracle = TemporalAttentionOracle(input_dim=len(feature_cols), seq_len=30).to(device)
 if os.path.exists(ORACLE_WEIGHTS):
     oracle.load_state_dict(torch.load(ORACLE_WEIGHTS, map_location=device))
 oracle.eval()
 
-print("[Neural Core] Loading Phase B (SAC Manager)...")
+logger.info("[Neural Core] Loading Phase B (SAC Manager)...")
 if os.path.exists(MANAGER_WEIGHTS):
     manager = SAC.load(MANAGER_WEIGHTS, device=device)
 else:
     manager = None
-    print("⚠️ Warning: SAC Manager weights not found. Signals will not trigger.")
+    logger.warning("⚠️ SAC Manager weights not found. Signals will not trigger.")
 
 @app.get("/webhook")
 async def verify_webhook(request: Request):
@@ -143,7 +167,7 @@ async def whatsapp_webhook(request: Request):
             phone_number = messages[0].get('from')
             wa_manager.update_interaction(phone_number)
     except Exception as e:
-        print(f"[Webhook Error] Malformed payload: {e}")
+        logger.error(f"[Webhook Error] Malformed payload: {e}")
     return {"status": "ok"}
 
 
@@ -154,7 +178,7 @@ async def health_check():
 
 async def live_trading_loop():
     """Background Event Loop: Pulls ticks, evaluates 15m structural closures, triggers RL inference."""
-    print("\n🚀 Initiating Live M1 Execution Loop. Standing by for ticks...")
+    logger.info("🚀 Initiating Live M1 Execution Loop. Standing by for ticks...")
     
     # State tracking for the manager network observations
     bars_since_last_trade = 0
@@ -167,7 +191,7 @@ async def live_trading_loop():
     # ==============================================================
     # THE HISTORICAL WARMUP PRELOADER
     # ==============================================================
-    print("⏳ Executing Instant Historical Warmup Sequence...")
+    logger.info("⏳ Executing Instant Historical Warmup Sequence...")
     try:
         hist_df = feed.fetch_historical_warmup(bars=15000)
         for timestamp, row in hist_df.iterrows():
@@ -179,10 +203,10 @@ async def live_trading_loop():
                 feature_vector = [latest_15m_features.get(c, 0.0) if not np.isnan(latest_15m_features.get(c, 0.0)) else 0.0 for c in feature_cols]
                 feature_buffer.append(feature_vector)
                 
-        print(f"✅ Warmup Complete. Engine Memory Saturated with {len(feature_engine.m15_history)} historical 15m candles.")
-        print("System Online. Transitioning to Live Tick polling...")
+        logger.info(f"✅ Warmup Complete. Engine Memory Saturated with {len(feature_engine.m15_history)} historical 15m candles.")
+        logger.info("System Online. Transitioning to Live Tick polling...")
     except Exception as e:
-        print(f"⚠️ Warmup Failed: {e}. Engine will fall back to live accumulation (may take days to saturate).")
+        logger.error(f"⚠️ Warmup Failed: {e}. Engine will fall back to live accumulation (may take days to saturate).")
     # ==============================================================
 
     while True:
@@ -192,7 +216,7 @@ async def live_trading_loop():
             
             # --- UTC Temporal Synchronization (New Day Reset) ---
             if timestamp.date() > current_day:
-                print(f"[{timestamp}] 📅 New trading day detected (UTC). Daily execution limit reset to 0.")
+                logger.info(f"[{timestamp}] 📅 New trading day detected (UTC). Daily execution limit reset to 0.")
                 current_day = timestamp.date()
                 trades_today = 0
 
@@ -227,10 +251,10 @@ async def live_trading_loop():
                     # --- CRITICAL: TEMPORAL EXECUTION GATES ---
                     if direction != 0:
                         if bars_since_last_trade < 96: # 24-hour cooldown
-                            print(f"[{timestamp}] ⏳ High-conviction signal detected, but blocked by 24h Cooldown.")
+                            logger.info(f"[{timestamp}] ⏳ High-conviction signal detected, but blocked by 24h Cooldown.")
                             direction = 0  
                         elif trades_today >= 1:        # Absolute hard cap (1 trade/day)
-                            print(f"[{timestamp}] 🛑 High-conviction signal detected, but blocked by Daily Limit.")
+                            logger.info(f"[{timestamp}] 🛑 High-conviction signal detected, but blocked by Daily Limit.")
                             direction = 0  
 
                     if direction != 0:
@@ -262,22 +286,21 @@ async def live_trading_loop():
                             "risk_profile": "Standard WFA Config"
                         }
                         
-                        print(f"[{timestamp}] 🚀 VALID SIGNAL DETECTED. Dispatching to WhatsApp Copilot...")
+                        logger.info(f"[{timestamp}] 🚀 VALID SIGNAL DETECTED. Dispatching to WhatsApp Copilot...")
                         
-                        # CRASH FIX: wa_manager.broadcast_signal is synchronous. Executing directly.
+                        # Execute synchronously to avoid async webhook crashes
                         wa_manager.broadcast_signal(signal_data)
                         
                         bars_since_last_trade = 0
                         trades_today += 1
 
-        # Poll MT5 at ~4Hz
+        # Poll MT5 at ~4Hz to prevent CPU pinning
         await asyncio.sleep(0.25)
 
 
 async def reminder_loop():
     """Background task running every 5 minutes to sweep and manage expiring client windows."""
     while True:
-        # Check reminders synchronously. Fast enough not to block MT5 polling.
         wa_manager.check_and_send_reminders()
         await asyncio.sleep(300)
 
