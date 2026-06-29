@@ -48,13 +48,30 @@ class StreamingFeatureEngine:
         self.m1_buffer = []
         self.m15_history = pd.DataFrame()
         self.is_warmed_up = False
+        
+        # --- NEW GATEKEEPER ---
+        self.last_closed_15m_mark = None 
 
     def process_m1_tick(self, timestamp, tick_row):
         self.m1_buffer.append(tick_row)
+        
+        # In live mode, this condition evaluates to True ~240 times a minute.
         if timestamp.minute % 15 == 0 and len(self.m1_buffer) > 0:
-            features = self._close_15m_candle(timestamp)
-            self.m1_buffer = [] 
-            return features
+            
+            # Standardize the timestamp to the exact 15-minute boundary
+            # e.g., 15:00:23 becomes exactly 15:00:00
+            current_15m_mark = timestamp.floor('15min')
+            
+            # THE FIX: Only close the candle IF we haven't already closed this exact block
+            if self.last_closed_15m_mark != current_15m_mark:
+                
+                # Pass the clean boundary timestamp to prevent microsecond mismatches
+                features = self._close_15m_candle(current_15m_mark)
+                
+                self.m1_buffer = [] 
+                self.last_closed_15m_mark = current_15m_mark
+                return features
+                
         return None
 
     def _close_15m_candle(self, timestamp):

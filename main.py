@@ -33,10 +33,9 @@ wa_manager = WhatsAppCopilot()
 print(f"[DEBUG] WhatsAppCopilot loaded from: {wa_manager.__class__.__module__}")
 
 # --- CORE SYSTEMS ---
-
 class LiveMT5Feed:
     """Asynchronous background connector to the open MT5 terminal."""
-    def __init__(self, xau_symbol="XAUUSD", dxy_symbol="DXY"):
+    def __init__(self, xau_symbol="XAUUSDr", dxy_symbol="USDIndex"):
         if not mt5.initialize():
             raise ConnectionError(f"MT5 Initialization failed: {mt5.last_error()}")
         self.xau = xau_symbol
@@ -190,6 +189,7 @@ async def live_trading_loop():
         timestamp, tick_row = feed.get_latest_tick()
         
         if timestamp and tick_row:
+            
             # --- UTC Temporal Synchronization (New Day Reset) ---
             if timestamp.date() > current_day:
                 print(f"[{timestamp}] 📅 New trading day detected (UTC). Daily execution limit reset to 0.")
@@ -229,7 +229,7 @@ async def live_trading_loop():
                         if bars_since_last_trade < 96: # 24-hour cooldown
                             print(f"[{timestamp}] ⏳ High-conviction signal detected, but blocked by 24h Cooldown.")
                             direction = 0  
-                        elif trades_today >= 1:        # Absolute hard cap
+                        elif trades_today >= 1:        # Absolute hard cap (1 trade/day)
                             print(f"[{timestamp}] 🛑 High-conviction signal detected, but blocked by Daily Limit.")
                             direction = 0  
 
@@ -263,17 +263,21 @@ async def live_trading_loop():
                         }
                         
                         print(f"[{timestamp}] 🚀 VALID SIGNAL DETECTED. Dispatching to WhatsApp Copilot...")
+                        
+                        # CRASH FIX: wa_manager.broadcast_signal is synchronous. Executing directly.
                         wa_manager.broadcast_signal(signal_data)
+                        
                         bars_since_last_trade = 0
                         trades_today += 1
 
-        # Poll MT5 at ~4Hz to prevent CPU pinning
+        # Poll MT5 at ~4Hz
         await asyncio.sleep(0.25)
 
 
 async def reminder_loop():
     """Background task running every 5 minutes to sweep and manage expiring client windows."""
     while True:
+        # Check reminders synchronously. Fast enough not to block MT5 polling.
         wa_manager.check_and_send_reminders()
         await asyncio.sleep(300)
 
