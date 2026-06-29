@@ -214,7 +214,7 @@ class M1HighFidelitySimulator:
         
         # --- THE FIX: Restore strict 1-trade-a-day architecture ---
         self.max_trades_per_day = 1
-        self.min_bars_between_trades = 96 # 24-hour structural cooldown
+        self.min_bars_between_trades = 4
 
         self._load_models(oracle_path, manager_path)
 
@@ -462,10 +462,10 @@ class M1HighFidelitySimulator:
                             direction = 2
 
                     if direction != 0:
-                        if bars_since_last_trade < self.min_bars_between_trades:
+                        if bars_since_last_trade < 4: # Reduced from 96 (1-hour cooldown)
                             direction = 0  
-                        elif trades_today >= self.max_trades_per_day:
-                            direction = 0  
+                        elif trades_today >= 1:       # Absolute hard cap (1 trade/day)
+                            direction = 0
 
                     # --- DEEP RESEARCH CAPTURE ---
                     research_record = {
