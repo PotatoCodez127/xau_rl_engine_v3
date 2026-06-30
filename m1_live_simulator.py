@@ -99,8 +99,8 @@ class StreamingFeatureEngine:
         low_close = np.abs(df["low"] - df["close"].shift())
         df["env_atr"] = np.max(pd.concat([high_low, high_close, low_close], axis=1), axis=1).rolling(14).mean()
 
-        ema_50h = df["close"].ewm(span=50, adjust=False).mean()
-        ema_200h = df["close"].ewm(span=200, adjust=False).mean()
+        ema_50h = df["close"].ewm(span=200, adjust=False).mean()
+        ema_200h = df["close"].ewm(span=800, adjust=False).mean()
         df["h4_trend"] = (ema_50h - ema_200h) / ema_200h
 
         h1_high = df["high"].rolling(window=4).max()
@@ -464,7 +464,7 @@ class M1HighFidelitySimulator:
                     if direction != 0:
                         if bars_since_last_trade < 4: # Reduced from 96 (1-hour cooldown)
                             direction = 0  
-                        elif trades_today >= 1:       # Absolute hard cap (1 trade/day)
+                        elif trades_today >= self.max_trades_per_day:       # Absolute hard cap (1 trade/day)
                             direction = 0
 
                     # --- DEEP RESEARCH CAPTURE ---
