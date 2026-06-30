@@ -31,7 +31,7 @@ class LiveMT5Feed:
         
         return timestamp, tick_row
     
-    def fetch_historical_warmup(self, bars=15000):
+    def fetch_historical_warmup(self, bars=16000):
         """Fetches the last N minutes of data to instantly saturate the engine's memory."""
         print(f"[MT5] Fetching last {bars} M1 bars for Instant Warmup...")
         
