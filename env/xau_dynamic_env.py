@@ -63,7 +63,7 @@ class XAUDynamicEnv(gym.Env):
 
         return np.clip(obs, -10.0, 10.0)
 
-    def step(self, action):
+def step(self, action):
         direction_val, size_val, tp_val, sl_val = (
             action[0],
             action[1],
@@ -81,6 +81,7 @@ class XAUDynamicEnv(gym.Env):
         tp_mult_used = 0.0
         sl_mult_used = 0.0
         frequency_penalty = 0.0
+        rr_penalty = 0.0
 
         self.bars_since_last_trade += 1
 
@@ -88,9 +89,7 @@ class XAUDynamicEnv(gym.Env):
             # --- CONSTRAINT 1: OVERTRADING PENALTY (Max 1/day) ---
             if self.bars_since_last_trade < self.min_bars_between_trades:
                 direction = 0  # Block execution
-                frequency_penalty = (
-                    -5.0
-                )  # Massive catastrophic penalty for trying to spam trades
+                frequency_penalty = -5.0  # Massive catastrophic penalty for trying to spam trades
             else:
                 # Valid Execution Sequence
                 self.bars_since_last_trade = 0
@@ -98,6 +97,12 @@ class XAUDynamicEnv(gym.Env):
                 sl_mult_used = ((sl_val + 1.0) / 2.0) * 1.0 + 0.5
                 tp_mult_used = sl_mult_used * (((tp_val + 1.0) / 2.0) * 2.0 + 1.0)
                 amount_at_risk = self.balance * risk_pct
+                
+                # --- NEW CONSTRAINT: ASYMMETRIC R:R INTENT PENALTY ---
+                theoretical_rr = tp_mult_used / sl_mult_used if sl_mult_used > 0 else 0
+                if theoretical_rr < 2.0:
+                    # Exponential decay penalty for low R:R intents (peaks at -8.0 for 0 R:R)
+                    rr_penalty = -2.0 * (2.0 - theoretical_rr)**2 
 
                 prob_win = (
                     self.df.loc[self.current_step, "prob_long"]
@@ -125,8 +130,10 @@ class XAUDynamicEnv(gym.Env):
         self.peak_balance = max(peak_equity, self.balance)
         drawdown = (self.peak_balance - self.balance) / self.peak_balance
 
+        # --- UPDATED REWARD TOPOGRAPHY ---
+        # Reward is now actively heavily suppressed by poor R:R selection (rr_penalty)
         raw_reward = simulated_pnl - (drawdown * self.initial_balance * 0.1)
-        reward = (raw_reward / (self.initial_balance * 0.01)) + frequency_penalty
+        reward = (raw_reward / (self.initial_balance * 0.01)) + frequency_penalty + rr_penalty
 
         reward = float(np.clip(reward, -10.0, 10.0))
 
@@ -139,6 +146,7 @@ class XAUDynamicEnv(gym.Env):
             "drawdown": drawdown,
             "tp_mult_used": tp_mult_used,
             "sl_mult_used": sl_mult_used,
+            "rr_penalty": rr_penalty
         }
 
         return self._get_obs(), reward, terminated, truncated, info

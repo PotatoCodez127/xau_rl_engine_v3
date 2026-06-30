@@ -6,6 +6,25 @@ from datetime import timezone
 from stable_baselines3 import SAC
 from models.oracle.attention_net import TemporalAttentionOracle
 
+class OmniVolatilityGatekeeper:
+    """Pre-trade firewall to physically block execution in structural chop zones."""
+    def __init__(self, min_volatility_percentile=0.45):
+        # 0.45 means the current H1 range must be larger than 45% of the last 24 hours.
+        self.min_volatility_percentile = min_volatility_percentile
+
+    def authorize_execution(self, h1_vol_regime: float, h4_trend: float, oracle_direction: int) -> bool:
+        # Block 1: Liquidity Void Check (Is the market moving enough to hit 2R?)
+        if h1_vol_regime < self.min_volatility_percentile:
+            return False
+            
+        # Block 2: Macro Trend Alignment (Is the 15m momentum fighting the 4H river?)
+        if oracle_direction == 1 and h4_trend < 0:
+            return False
+        if oracle_direction == 2 and h4_trend > 0:
+            return False
+            
+        return True
+
 class HighFidelitySimulator:
     def __init__(self, data_path, oracle_path, manager_path):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -75,6 +94,9 @@ class HighFidelitySimulator:
         holdout_start_idx = int(len(self.df) * 0.8)
         print(f"Executing Asynchronous Backtest Engine...")
         print(f"Enforcing OOS Firewall: Starting simulation at step {holdout_start_idx}.")
+
+        # Instantiate the Gatekeeper
+        gatekeeper = OmniVolatilityGatekeeper(min_volatility_percentile=0.45)
 
         equity = self.initial_balance
         high_water_mark = self.initial_balance
@@ -269,17 +291,32 @@ class HighFidelitySimulator:
             prob_hold, prob_long, prob_short = self._get_oracle_probs(i)
             EXECUTION_THRESHOLD = 0.35
             current_h4_trend = current_bar.get("h4_trend", 0)
-            direction = 0
-
+            current_h1_vol_regime = current_bar.get("h1_vol_regime", 0.5)
+            
+            # Step A: Determine raw Oracle intent
+            oracle_direction = 0
             if prob_long > EXECUTION_THRESHOLD and prob_long > prob_short:
-                if current_h4_trend > 0:
-                    direction = 1
+                oracle_direction = 1
             elif prob_short > EXECUTION_THRESHOLD and prob_short > prob_long:
-                if current_h4_trend < 0:
-                    direction = 2
+                oracle_direction = 2
 
-            if direction != 0 and bars_since_last_trade < self.min_bars_between_trades:
-                direction = 0
+            # Step B: Gatekeeper Authorization
+            direction = 0
+            if oracle_direction != 0:
+                is_authorized = gatekeeper.authorize_execution(
+                    h1_vol_regime=current_h1_vol_regime,
+                    h4_trend=current_h4_trend,
+                    oracle_direction=oracle_direction
+                )
+                
+                # Step C: Temporal & Cooldown Check
+                if is_authorized and bars_since_last_trade >= self.min_bars_between_trades:
+                    direction = oracle_direction
+
+            # Step D: SAC Manager Execution (Only triggered if direction != 0)
+            if direction != 0:
+                features = current_bar[self.feature_cols].values
+                obs = np.zeros(len(self.feature_cols) + 6, dtype=np.float32)
 
             if direction != 0:
                 features = current_bar[self.feature_cols].values
