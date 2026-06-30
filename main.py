@@ -91,7 +91,7 @@ class LiveMT5Feed:
         }
         return timestamp, tick_row
 
-    def fetch_historical_warmup(self, bars=15000):
+    def fetch_historical_warmup(self, bars=16000):
         """Fetches the last N minutes of data to instantly saturate the engine's memory."""
         logger.info(f"[MT5] Fetching last {bars} M1 bars for Instant Warmup...")
         
@@ -255,12 +255,12 @@ async def live_trading_loop():
 
                     # --- CRITICAL: TEMPORAL EXECUTION GATES ---
                     if direction != 0:
-                        if bars_since_last_trade < 96: # 24-hour cooldown
-                            logger.info(f"[{timestamp}] ⏳ High-conviction signal detected, but blocked by 24h Cooldown.")
+                        if bars_since_last_trade < 4: # Reduced from 96 (1-hour cooldown)
+                            logger.info(f"[{timestamp}] ⏳ High-conviction signal detected, but blocked by 1h structural cooldown.")
                             direction = 0  
-                        elif trades_today >= 1:        # Absolute hard cap (1 trade/day)
+                        elif trades_today >= 1:       # Absolute hard cap (1 trade/day)
                             logger.info(f"[{timestamp}] 🛑 High-conviction signal detected, but blocked by Daily Limit.")
-                            direction = 0  
+                            direction = 0
 
                     if direction != 0:
                         # Construct Manager Observation Space
