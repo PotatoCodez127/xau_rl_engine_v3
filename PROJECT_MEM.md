@@ -167,3 +167,33 @@ To reduce execution frequency to a realistic retail range (1–2 trades/day) and
   * **Stateful Feature Synthesis:** Built a streaming feature engine that silently maintains rolling window history (up to the 800-period H4 trend EMA) and synthesizes 15m OHLCV and Fractional Differentiation vectors dynamically at the `OnBarClose` event.
   * **Tick-Level Trailing Logic:** PnL evaluations and Prop Firm Circuit Breakers (Guardian Shield, Consistency Cap) are now evaluated sequentially on M1 ticks, guaranteeing exact $37.50 liquidations without gap oversights.
   * **Execution Latency Profiling:** Integrated a nanosecond perf-counter (`time.perf_counter()`) encompassing the feature synthesis and PyTorch/SB3 inference stack to mathematically verify real-world execution speeds before API deployment.
+
+  Here is the formalized update for your `PROJECT_MEM.md` file.
+
+## 32. Live Deployment: FastAPI & Meta WhatsApp Copilot
+* **Objective:** Transition the `m1_live_simulator.py` logic into a continuous, asynchronous server environment capable of executing and broadcasting trades in real-time.
+* **Architecture (`main.py`):**
+* Built an asynchronous `FastAPI` server polling the MetaTrader 5 terminal at 4Hz to ensure low-latency tick ingestion without pinning the CPU.
+* Integrated a Meta Webhook listener and a background WhatsApp continuous daemon (`WhatsAppCopilot`) to broadcast valid neural signals directly to users, dynamically bypassing Meta's strict 24-hour customer service window timeout rules via automated sync reminders.
+* Implemented a Dual-Tier Logging architecture mapping server outputs to both a persistent UTC-timestamped file (`live_engine.log`) and a live terminal stream for immediate proof-of-life visibility.
+
+## 33. Zero-Latency Boot: The Historical Preloader
+* **Diagnosis:** The 15m feature engine requires extensive historical data (up to the maximum EMA lookback) to calculate trend states, plus 30 consecutive candles to fill the PyTorch observation buffer. In a live environment, this would cause an 8.3-day dormant period before the first inference could occur.
+* **Architecture Update:** Engineered a Historical Preloader sequence. Upon boot, the MT5 connector instantly fetches the last 16,000 M1 bars and feeds them sequentially into the `StreamingFeatureEngine`. This instantly saturates the mathematical arrays and the 30-step PyTorch `feature_buffer`, allowing the neural network to output probabilities the very second the server transitions to the live polling loop.
+* **Feature Engine Optimization:** Reduced the maximum H4 EMA lookback requirement from 800 periods to 200 periods, optimizing memory saturation speed while maintaining macro-trend integrity.
+
+## 34. High-Frequency Live Gating (The 4Hz Collision)
+* **Diagnosis:** Moving from a discrete 1-tick-per-minute simulator to a 4-tick-per-second live environment caused a Pandas `ValueError` (duplicate axis indices). The engine was calculating and closing the 15-minute candle hundreds of times within the `:00` boundary minute.
+* **Architecture Update:** Injected a strict stateful gatekeeper (`self.last_closed_15m_mark`) into the `StreamingFeatureEngine`. The engine now floors the timestamp to the absolute 15-minute boundary and locks the closure function, preventing duplicate array appends and preserving index integrity regardless of polling frequency.
+
+## 35. Deep Analytics: Two-Tier OOS Logging
+* **Objective:** Ensure complete transparency into the neural network's decision-making process during Out-Of-Sample (OOS) execution, even when the bot chooses not to trade.
+* **Architecture Update:** Implemented a continuous Dual-Exporter framework in the simulator:
+1. **Trade Journal (`high_fidelity_journal.csv`):** Captures exact entry/exit pricing, total friction costs, gross/net PnL, and the physical reason for closure (e.g., Consistency Clip, Trailing Drawdown, Prop Target).
+2. **Neural Research Log (`neural_research_log.csv`):** A granular heartbeat log generating a chronological matrix of every single 15m candle. It records exact probabilities (`prob_long`, `prob_short`), macro-trend values, environmental ATR, and SAC Sizing Intent, allowing for deep autopsy of Oracle/Gatekeeper collisions.
+
+## 36. Resolution of Rolling Window vs. Session Reset Conflict
+* **Diagnosis:** The execution governor was cannibalizing yield by fighting itself. A strict daily counter (`trades_today`) reset at UTC midnight, but a rolling 24-hour inter-trade cooldown (`bars_since_last_trade < 96`) remained active. This mathematically locked the bot out of trading highly profitable morning sessions if a trade was taken the previous evening.
+* **Architecture Update:** Decoupled the daily limit from the inter-trade cooldown.
+* The hard limit of **1 trade per day** is now exclusively anchored to the UTC midnight session reset.
+* The structural rolling cooldown was reduced from 96 bars (24 hours) down to **4 bars (1 hour)**, acting merely as an anti-cluster buffer to prevent the agent from firing multiple signals in the same immediate chop zone.
