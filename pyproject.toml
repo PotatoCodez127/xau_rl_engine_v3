@@ -1,0 +1,7 @@
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint.pep8-naming]
+# Explicitly whitelist mathematical tensor terms to prevent N806 violations
+ignore-names = ["X", "X_train", "X_val", "X_test"]
