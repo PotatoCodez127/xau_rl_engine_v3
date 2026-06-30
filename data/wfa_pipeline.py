@@ -13,6 +13,14 @@ class WalkForwardPipeline:
 
     def load_data(self, holdout_fraction: float = 0.2) -> pd.DataFrame:
         self.master_df = pd.read_csv(self.features_path, index_col=0, parse_dates=True)
+        
+        # --- TEMPORAL INTEGRITY ---
+        # Enforce UTC synchronization for automated CI runners and cloud nodes
+        if self.master_df.index.tz is None:
+            self.master_df.index = self.master_df.index.tz_localize('UTC')
+        else:
+            self.master_df.index = self.master_df.index.tz_convert('UTC')
+            
         if holdout_fraction > 0:
             train_boundary = int(len(self.master_df) * (1 - holdout_fraction))
             self.master_df = self.master_df.iloc[:train_boundary]
