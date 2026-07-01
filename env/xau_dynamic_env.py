@@ -4,29 +4,38 @@ import gymnasium as gym
 from gymnasium import spaces
 
 class XAUDynamicEnv(gym.Env):
+    """
+    XAUUSD Master-Slave Execution Environment (V3.2).
+    Phase A (Oracle) strictly dictates direction. Phase B (SAC Manager) exclusively dictates sizing.
+    """
     def __init__(self, df: pd.DataFrame, initial_balance=10000.0):
         super(XAUDynamicEnv, self).__init__()
-        # Preserve datetime for UTC session boundaries
+        
         self.df = df.reset_index()
         self.initial_balance = initial_balance
         self.friction_cost = 10.0
 
-        self.min_bars_between_trades = 4  # Aligned with OOS
-        self.max_trades_per_day = 1
-        self.urgency_threshold = 240  
+        # Structural Gating Constraints
+        self.min_bars_between_trades = 4  # 1-hour anti-cluster cooldown
+        self.max_trades_per_day = 1       # Prop-firm frequency survival constraint
+        
+        # --- ACTION SPACE ASYMMETRY BINDING ---
+        # Action Space Reduced to 2 Dimensions: [Stop Loss Multiplier, Take Profit Multiplier]
+        # Bounded continuously between -1.0 and 1.0 for Stable-Baselines3 SAC gradient stability.
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
 
-        # ACTION SPACE REDUCED TO 3 (Size, TP, SL). Direction is handled by the Oracle.
-        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32)
-
+        # Feature Pipeline
         exclude_cols = ["target", "time", "datetime", "date", "index"]
         self.feature_cols = [
             c for c in df.columns if c not in exclude_cols and not c.startswith("env_")
         ]
 
+        # Observation Space: Features + Oracle Probabilities + Account State Vectors
         self.observation_space = spaces.Box(
             low=-10.0, high=10.0, shape=(len(self.feature_cols) + 3,), dtype=np.float32
         )
 
+        # State Variables
         self.current_step = 30
         self.balance = self.initial_balance
         self.peak_balance = self.initial_balance
@@ -35,6 +44,7 @@ class XAUDynamicEnv(gym.Env):
         self.current_day = pd.to_datetime(self.df.loc[self.current_step, "datetime"]).date()
 
     def reset(self, seed=None, options=None):
+        """Resets the environment for the next WFA training epoch."""
         super().reset(seed=seed)
         self.current_step = 30
         self.balance = self.initial_balance
@@ -45,14 +55,45 @@ class XAUDynamicEnv(gym.Env):
         return self._get_obs(), {}
 
     def _get_obs(self):
+        """Builds the 1D Tensor state observation for the SAC Agent."""
         obs = np.zeros(self.observation_space.shape[0], dtype=np.float32)
         X = self.df.loc[self.current_step, self.feature_cols].values
         obs[: len(X)] = X
 
+        # Account Health Vectors
         obs[-3] = float(np.clip(self.balance / self.initial_balance, 0.0, 10.0))
         obs[-2] = float(np.clip((self.peak_balance - self.balance) / self.peak_balance, 0.0, 1.0))
         obs[-1] = float(np.clip(self.bars_since_last_trade / 480.0, 0.0, 1.0))
+        
         return np.clip(obs, -10.0, 10.0)
+
+    def _scale_action(self, action: np.ndarray) -> tuple[float, float]:
+        """
+        Maps the [-1, 1] SAC output to strictly bounded asymmetric risk profiles.
+        This prevents Risk Inversion (e.g., risking $100 to make $45).
+        """
+        # SL Multiplier: 0.5x to 2.0x ATR
+        sl_mult = 0.5 + ((action[0] + 1.0) * (2.0 - 0.5)) / 2.0
+        
+        # TP Multiplier: 1.0x to 3.0x of the chosen SL (ensuring mathematical positive expectancy)
+        tp_mult = 1.0 + ((action[1] + 1.0) * (3.0 - 1.0)) / 2.0
+        
+        return sl_mult, tp_mult
+
+    def _evaluate_master_slave_trigger(self, prob_long: float, prob_short: float, prob_hold: float, h4_trend: float) -> int:
+        """
+        Phase A Directional Logic. Evaluates Relative Conviction and the absolute H4 Macro Gate.
+        Returns: 1 (Long), 2 (Short), 0 (Hold)
+        """
+        EXECUTION_THRESHOLD = 0.35
+        
+        # Relative Conviction + Macro Gating (H4 Trend Alignment)
+        if prob_long > EXECUTION_THRESHOLD and prob_long > prob_hold and h4_trend > 0:
+            return 1
+        elif prob_short > EXECUTION_THRESHOLD and prob_short > prob_hold and h4_trend < 0:
+            return 2
+            
+        return 0
 
     def step(self, action):
         step_time = pd.to_datetime(self.df.loc[self.current_step, "datetime"])
@@ -62,40 +103,37 @@ class XAUDynamicEnv(gym.Env):
             self.current_day = step_time.date()
             self.trades_today = 0
 
-        # Unpack the 3D action space
-        size_val, tp_val, sl_val = action[0], action[1], action[2]
+        # Unpack and bound the action space
+        sl_mult_used, tp_mult_ratio = self._scale_action(action)
+        tp_mult_used = sl_mult_used * tp_mult_ratio 
 
-        # Oracle Master-Slave Logic
+        # Oracle Master-Slave Logic Extraction
         prob_long = self.df.loc[self.current_step, "prob_long"]
         prob_short = self.df.loc[self.current_step, "prob_short"]
+        prob_hold = self.df.loc[self.current_step, "prob_hold"]
         h4_trend = self.df.loc[self.current_step, "h4_trend"]
         
-        direction = 0
-        EXECUTION_THRESHOLD = 0.35
-        if prob_long > EXECUTION_THRESHOLD and prob_long > prob_short and h4_trend > 0:
-            direction = 1
-        elif prob_short > EXECUTION_THRESHOLD and prob_short > prob_long and h4_trend < 0:
-            direction = 2
+        direction = self._evaluate_master_slave_trigger(prob_long, prob_short, prob_hold, h4_trend)
 
-        # Constraints
+        # Operational Constraints (Frequency Gating)
         if self.bars_since_last_trade < self.min_bars_between_trades or self.trades_today >= self.max_trades_per_day:
             direction = 0
 
         simulated_pnl = 0.0
-        frequency_penalty = 0.0
         self.bars_since_last_trade += 1
+        
+        # --- EPISODIC REWARD ENGINEERING ---
+        # Base reward is zero. No step-by-step inactivity penalties.
+        reward = 0.0  
 
         if direction != 0:
             self.bars_since_last_trade = 0
             self.trades_today += 1
             
-            risk_pct = ((size_val + 1.0) / 2.0) * 0.05
-            sl_mult_used = ((sl_val + 1.0) / 2.0) * 1.0 + 0.5
-            
-            # Floor TP at 1.0x, Ceiling at 3.0x to avoid baseline inversion
-            tp_mult_used = sl_mult_used * (((tp_val + 1.0) / 2.0) * 2.0 + 1.0) 
-            amount_at_risk = self.balance * risk_pct
+            # Dynamic Compounding: Fixed 1.5% Risk Protocol
+            amount_at_risk = self.balance * 0.015
 
+            # Instant theoretical resolution for training speed
             prob_win = prob_long if direction == 1 else prob_short
 
             if np.random.rand() < prob_win:
@@ -104,20 +142,30 @@ class XAUDynamicEnv(gym.Env):
                 simulated_pnl = -amount_at_risk
 
             simulated_pnl -= self.friction_cost
-        else:
-            if self.bars_since_last_trade > self.urgency_threshold:
-                frequency_penalty = -0.05 * ((self.bars_since_last_trade - self.urgency_threshold) / 100.0)
+            self.balance += simulated_pnl
+            self.peak_balance = max(max(self.initial_balance, self.peak_balance), self.balance)
+            
+            # --- TERMINAL CALMAR REWARD PROXY ---
+            # The agent is only graded upon the conclusion of a trade.
+            # Reward structurally optimizes for highest net PnL relative to induced Account Drawdown.
+            drawdown = (self.peak_balance - self.balance) / self.peak_balance
+            drawdown_penalty = drawdown * self.initial_balance * 0.25
+            
+            raw_reward = simulated_pnl - drawdown_penalty
+            
+            # Normalize to [-10, 10] range for SAC stability
+            reward = float(np.clip((raw_reward / (self.initial_balance * 0.01)), -10.0, 10.0))
 
-        self.balance += simulated_pnl
-        self.peak_balance = max(max(self.initial_balance, self.peak_balance), self.balance)
-        drawdown = (self.peak_balance - self.balance) / self.peak_balance
-
-        # Removed the arbitrary rr_penalty to allow 1.5R momentum scalps
-        raw_reward = simulated_pnl - (drawdown * self.initial_balance * 0.1)
-        reward = float(np.clip((raw_reward / (self.initial_balance * 0.01)) + frequency_penalty, -10.0, 10.0))
-
+        # Check termination conditions (Account Blown)
         self.current_step += 1
         terminated = self.balance < (self.initial_balance * 0.1)
         truncated = self.current_step >= len(self.df) - 1
 
-        return self._get_obs(), reward, terminated, truncated, {}
+        info = {
+            "prob_long": prob_long,
+            "prob_short": prob_short,
+            "sl_mult_used": sl_mult_used,
+            "tp_mult_used": tp_mult_used,
+        }
+
+        return self._get_obs(), reward, terminated, truncated, info
