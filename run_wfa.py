@@ -1,6 +1,13 @@
 import os
 from data.wfa_pipeline import WalkForwardPipeline
 from models.manager.train_manager import ManagerPipeline
+import multiprocessing as mp
+import torch
+import os
+# Stop TensorFlow from greedily locking 100% of the GPU VRAM
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
+# Suppress the TensorFlow C++ warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 def execute_wfa_training():
     DATA_PATH = "data/processed/labeled_features_15m.csv"
@@ -50,4 +57,8 @@ def execute_wfa_training():
         print(f"Split {idx} Complete. Weights preserved at {current_model_path}")
 
 if __name__ == "__main__":
-    execute_wfa_training()
+  try:
+        mp.set_start_method('spawn', force=True)
+  except RuntimeError:
+      pass
+  execute_wfa_training()

@@ -7,7 +7,7 @@ from stable_baselines3.common.callbacks import EvalCallback
 from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
 from stable_baselines3.common.env_util import make_vec_env
 from sklearn.preprocessing import StandardScaler
-
+import gc
 from env.xau_dynamic_env import XAUDynamicEnv
 from models.oracle.attention_net import TemporalAttentionOracle
 
@@ -89,6 +89,9 @@ class ManagerPipeline:
         os.makedirs(save_dir, exist_ok=True)
 
         print("[CHECKPOINT 3] Building SAC Neural Architecture (RAM Optimized)...")
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         model = SAC(
             "MlpPolicy",
             train_env,
