@@ -65,18 +65,19 @@ class ManagerPipeline:
         val_df: pd.DataFrame,
         previous_sac_path: str = None,
     ):
+        print(f"[CHECKPOINT 1] Pre-computing Phase A Oracle features for Split {split_idx}...")
         enriched_train = self._precompute_oracle_features(train_df.copy())
         enriched_val = self._precompute_oracle_features(val_df.copy())
 
-        # Phase 3 Hardware Scaling: 8 Parallel Environments
+        print("[CHECKPOINT 2] Initializing DummyVecEnv (Loop-based Vectorization)...")
+        # Structurally safe: Executes environments sequentially to preserve CUDA context
         train_env = make_vec_env(
             XAUDynamicEnv, 
-            n_envs=8, 
+            n_envs=4, 
             env_kwargs={"df": enriched_train}, 
-            vec_env_cls=SubprocVecEnv
+            vec_env_cls=DummyVecEnv
         )
         
-        # Validation only requires a single thread
         val_env = make_vec_env(
             XAUDynamicEnv, 
             n_envs=1, 
@@ -87,15 +88,14 @@ class ManagerPipeline:
         save_dir = f"./models/manager/saved/wfa_{split_idx}/"
         os.makedirs(save_dir, exist_ok=True)
 
-        # This guarantees `ent_coef='auto'` and all optimizers are correctly built in PyTorch.
-        print("Initializing explicit V3 SAC Architecture (Hardware Scaled)...")
+        print("[CHECKPOINT 3] Building SAC Neural Architecture (RAM Optimized)...")
         model = SAC(
             "MlpPolicy",
             train_env,
             gamma=0.9245,
             learning_rate=0.000253,
-            batch_size=1024,
-            buffer_size=1000000,
+            batch_size=1024,          
+            buffer_size=250000,       
             tau=0.00137,
             train_freq=16,
             ent_coef="auto",
@@ -103,10 +103,12 @@ class ManagerPipeline:
             tensorboard_log="logs/",
             device=self.device,
         )
-        # 2. If continuous memory exists, selectively inject the weights.
+
         if previous_sac_path and os.path.exists(previous_sac_path):
-            print(f"Injecting Continuous Memory from: {previous_sac_path}")
+            print(f"[CHECKPOINT 4] Injecting Continuous Memory from: {previous_sac_path}")
             model.set_parameters(previous_sac_path, exact_match=False)
+        else:
+            print("[CHECKPOINT 4] No previous memory found. Initializing blank weights.")
 
         eval_callback = EvalCallback(
             val_env,
@@ -117,11 +119,18 @@ class ManagerPipeline:
             render=False,
         )
 
-        print(f"--- Starting Manager Training for Split {split_idx} ---")
-        model.learn(
-            total_timesteps=50000, callback=eval_callback, reset_num_timesteps=False
-        )
-        train_env.close()
-        val_env.close()
+        print(f"[CHECKPOINT 5] Triggering model.learn() for Split {split_idx}...")
+        try:
+            model.learn(
+                total_timesteps=50000, callback=eval_callback, reset_num_timesteps=False
+            )
+            print(f"[CHECKPOINT 6] model.learn() successfully completed for Split {split_idx}.")
+        except Exception as e:
+            print(f"[FATAL ERROR] Crash during model.learn(): {e}")
+            raise e
+        finally:
+            print("[CHECKPOINT 7] Freeing SubprocVecEnv memory buffers...")
+            train_env.close()
+            val_env.close()
         
         return f"{save_dir}best_model.zip"
