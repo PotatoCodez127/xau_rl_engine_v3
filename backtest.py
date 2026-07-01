@@ -197,16 +197,27 @@ def run_backtest():
     while not (terminated or truncated):
         previous_balance = env.balance
 
+        # Replace the manual action[0] directional logic inside the `while not (terminated or truncated):` loop
         action, _states = model.predict(obs, deterministic=True)
         obs, reward, terminated, truncated, info = env.step(action)
 
         current_balance = env.balance
+        
+        # In the new env, if balance changes (excluding minor drift), a trade occurred
+        trade_executed = abs((current_balance - previous_balance) - reward) > 0.1 # Approximation block
 
+        # Because the env now perfectly mimics OOS, you can streamline the backtester:
         direction_val = 0
-        if action[0] > 0.33:
-            direction_val = 1
-        elif action[0] < -0.33:
-            direction_val = 2
+        if current_balance != previous_balance and env.bars_since_last_trade == 1:
+            # We must derive what the environment did based on the Oracle state
+            prob_long = env.df.loc[env.current_step - 1, "prob_long"]
+            prob_short = env.df.loc[env.current_step - 1, "prob_short"]
+            h4_trend = env.df.loc[env.current_step - 1, "h4_trend"]
+            
+            if prob_long > 0.35 and prob_long > prob_short and h4_trend > 0:
+                direction_val = 1
+            elif prob_short > 0.35 and prob_short > prob_long and h4_trend < 0:
+                direction_val = 2
 
         # Access probabilities via the info dict passed from the new environment step
         prob_long = info.get("prob_long", 0.0)
