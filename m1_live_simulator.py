@@ -19,7 +19,7 @@ class DualM1DataFeed:
         
         # --- PRE-SLICE THE DATA ---
         total_data = len(self.master_stream)
-        oos_size = int(total_data)  
+        oos_size = int(total_data*0.20)  
         warmup_buffer = 3000               
         
         start_index = max(0, total_data - oos_size - warmup_buffer)
@@ -240,10 +240,23 @@ class M1HighFidelitySimulator:
         self.feature_buffer = deque(maxlen=30)
 
     def is_restricted_time(self, current_time: pd.Timestamp) -> bool:
+        # 1. Existing Bank Rollover Filter (Illiquid Spreads)
         if (current_time.hour == 23 and current_time.minute >= 45) or (
             current_time.hour == 0 and current_time.minute <= 30
         ):
             return True
+            
+        # 2. Tier-1 Macro Event Slippage Filter (UTC aligned)
+        # Blocks 13:30 UTC (8:30 AM EST - CPI/NFP) with a 15 min buffer: 13:15 to 13:45
+        if current_time.hour == 13 and (15 <= current_time.minute <= 45):
+            return True
+            
+        # Blocks 18:00 UTC (2:00 PM EST - FOMC) with a 15 min buffer: 17:45 to 18:15
+        if current_time.hour == 17 and current_time.minute >= 45:
+             return True
+        if current_time.hour == 18 and current_time.minute <= 15:
+             return True
+             
         return False
 
     def run_simulation(self):
@@ -309,41 +322,51 @@ class M1HighFidelitySimulator:
             account_failed = False
             account_passed = False
             
+            # --- 3. M1 TICK-LEVEL TRADE MANAGEMENT ---
+            account_failed = False
+            account_passed = False
+            
             if active_trade is not None:
                 trade_closed = False
                 exit_price = 0.0
                 exit_reason = ""
 
-                current_price = tick_row["xau_close"]
-                current_distance_pips = (current_price - active_trade["entry"]) * 10.0
-                if active_trade["type"] == "Short":
-                    current_distance_pips = -current_distance_pips
-                
-                floating_pnl = current_distance_pips * self.pip_value_per_lot * active_trade["lot_size"] - active_trade["total_friction"]
-                current_floating_equity = equity + floating_pnl
+                # --- 1. PHANTOM DRAWDOWN FIX: Evaluate Worst-Case Excursion ---
+                if active_trade["type"] == "Long":
+                    # Worst case for a Long is the lowest point of the minute
+                    worst_price = tick_row["xau_low"] 
+                    worst_distance_pips = (worst_price - active_trade["entry"]) * 10.0
+                    best_price = tick_row["xau_high"] # For Take Profit
+                else: 
+                    # Worst case for a Short is the highest point of the minute + spread
+                    worst_price = tick_row["xau_high"] + (self.spread_pips * 0.1) 
+                    worst_distance_pips = (active_trade["entry"] - worst_price) * 10.0
+                    best_price = tick_row["xau_low"] # For Take Profit
 
-                if current_floating_equity <= (daily_start_equity - self.max_daily_loss):
-                    trade_closed, exit_price, exit_reason = (True, current_price, "Daily Drawdown Breached")
+                # Calculate equity at the exact moment of the worst price spike
+                worst_floating_pnl = (worst_distance_pips * self.pip_value_per_lot * active_trade["lot_size"]) - active_trade["total_friction"]
+                worst_floating_equity = equity + worst_floating_pnl
+
+                # --- 2. GLOBAL CIRCUIT BREAKERS (Evaluated against Worst Excursion) ---
+                if worst_floating_equity <= (daily_start_equity - self.max_daily_loss):
+                    trade_closed, exit_price, exit_reason = (True, worst_price, "Daily Drawdown Breached (Intra-minute)")
                     trading_locked_for_day = True
-                elif current_floating_equity <= (high_water_mark - self.max_trailing_loss):
-                    trade_closed, exit_price, exit_reason = (True, current_price, "Trailing Drawdown Breached")
+                elif worst_floating_equity <= (high_water_mark - self.max_trailing_loss):
+                    trade_closed, exit_price, exit_reason = (True, worst_price, "Trailing Drawdown Breached (Intra-minute)")
                     account_failed = True
-                elif current_floating_equity >= self.profit_target:
-                    trade_closed, exit_price, exit_reason = (True, current_price, "Profit Target Reached")
-                    account_passed = True
-                elif floating_pnl <= self.guardian_shield_loss:
-                    trade_closed, exit_price, exit_reason = (True, current_price, "Guardian Shield (1% Loss)")
-                elif floating_pnl >= self.consistency_cap_usd:
-                    trade_closed, exit_price, exit_reason = (True, current_price, "Consistency Hard Clip (15% Rule)")
+                elif worst_floating_pnl <= self.guardian_shield_loss:
+                    trade_closed, exit_price, exit_reason = (True, worst_price, "Guardian Shield (1% Loss)")
+                
+                # --- 3. STANDARD TARGET EXECUTIONS ---
                 elif active_trade["type"] == "Long":
-                    if tick_row["xau_low"] <= active_trade["sl"]:
+                    if worst_price <= active_trade["sl"]:
                         trade_closed, exit_price, exit_reason = (True, active_trade["sl"], "Stop Loss")
-                    elif tick_row["xau_high"] >= active_trade["tp"]:
+                    elif best_price >= active_trade["tp"]:
                         trade_closed, exit_price, exit_reason = (True, active_trade["tp"], "Take Profit")
                 elif active_trade["type"] == "Short":
-                    if tick_row["xau_high"] >= active_trade["sl"]:
+                    if worst_price >= active_trade["sl"]:
                         trade_closed, exit_price, exit_reason = (True, active_trade["sl"], "Stop Loss")
-                    elif tick_row["xau_low"] <= active_trade["tp"]:
+                    elif best_price <= active_trade["tp"]:
                         trade_closed, exit_price, exit_reason = (True, active_trade["tp"], "Take Profit")
 
                 if trade_closed:
@@ -494,7 +517,9 @@ class M1HighFidelitySimulator:
                         obs[30] = float(np.clip(bars_since_last_trade / 480.0, 0.0, 1.0))
                         
                         action, _ = self.manager.predict(obs, deterministic=True)
-                        size_val, tp_val, sl_val = action[1], action[2], action[3]
+                        
+                        # SHIFTED INDICES: The SAC agent now only outputs 3 dimensions.
+                        size_val, tp_val, sl_val = action[0], action[1], action[2]
                         
                         sl_mult = ((sl_val + 1.0) / 2.0) * 1.0 + 0.5
                         tp_mult = sl_mult * (((tp_val + 1.0) / 2.0) * 2.0 + 1.0)
@@ -553,8 +578,8 @@ class M1HighFidelitySimulator:
         return yield_df
 
 if __name__ == "__main__":
-    XAU = "data/raw/XAUUSDr_M1.csv"
-    DXY = "data/raw/USDIndex_M1.csv"
+    XAU = "data/raw/XAUUSDr_M1_OG.csv"
+    DXY = "data/raw/USDIndex_M1_OG.csv"
     ORACLE = "models/oracle/best_oracle.pth"
     MANAGER = "models/manager/saved/wfa_43/best_model.zip"
     
