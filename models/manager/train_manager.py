@@ -4,12 +4,12 @@ import numpy as np
 import pandas as pd
 from stable_baselines3 import SAC
 from stable_baselines3.common.callbacks import EvalCallback
-from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
+from stable_baselines3.common.env_util import make_vec_env
 from sklearn.preprocessing import StandardScaler
 
 from env.xau_dynamic_env import XAUDynamicEnv
 from models.oracle.attention_net import TemporalAttentionOracle
-
 
 class ManagerPipeline:
     def __init__(
@@ -68,24 +68,37 @@ class ManagerPipeline:
         enriched_train = self._precompute_oracle_features(train_df.copy())
         enriched_val = self._precompute_oracle_features(val_df.copy())
 
-        train_env = Monitor(XAUDynamicEnv(df=enriched_train))
-        val_env = Monitor(XAUDynamicEnv(df=enriched_val))
+        # Phase 3 Hardware Scaling: 8 Parallel Environments
+        train_env = make_vec_env(
+            XAUDynamicEnv, 
+            n_envs=8, 
+            env_kwargs={"df": enriched_train}, 
+            vec_env_cls=SubprocVecEnv
+        )
+        
+        # Validation only requires a single thread
+        val_env = make_vec_env(
+            XAUDynamicEnv, 
+            n_envs=1, 
+            env_kwargs={"df": enriched_val}, 
+            vec_env_cls=DummyVecEnv
+        )
 
         save_dir = f"./models/manager/saved/wfa_{split_idx}/"
         os.makedirs(save_dir, exist_ok=True)
 
-        # 1. ALWAYS initialize the explicit V3 architecture.
         # This guarantees `ent_coef='auto'` and all optimizers are correctly built in PyTorch.
-        print("Initializing explicit V3 SAC Architecture...")
+        print("Initializing explicit V3 SAC Architecture (Hardware Scaled)...")
         model = SAC(
             "MlpPolicy",
             train_env,
             gamma=0.9245,
             learning_rate=0.000253,
-            batch_size=256,
+            batch_size=1024,
+            buffer_size=1000000,
             tau=0.00137,
             train_freq=16,
-            ent_coef="auto",  # Keep dynamic entropy enabled
+            ent_coef="auto",
             verbose=1,
             tensorboard_log="logs/",
             device=self.device,
@@ -108,4 +121,7 @@ class ManagerPipeline:
         model.learn(
             total_timesteps=50000, callback=eval_callback, reset_num_timesteps=False
         )
-        return f"{save_dir}best_model.zip"  # Return path for the next loop
+        train_env.close()
+        val_env.close()
+        
+        return f"{save_dir}best_model.zip"
