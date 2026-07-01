@@ -63,7 +63,7 @@ class XAUDynamicEnv(gym.Env):
 
         return np.clip(obs, -10.0, 10.0)
 
-def step(self, action):
+    def step(self, action):
         direction_val, size_val, tp_val, sl_val = (
             action[0],
             action[1],
