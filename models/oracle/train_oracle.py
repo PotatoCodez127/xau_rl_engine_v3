@@ -1,106 +1,142 @@
 import os
 import torch
+import torch.nn as nn
 import torch.optim as optim
-import pandas as pd
+from torch.utils.data import Dataset, DataLoader
 import numpy as np
+import pandas as pd
+import logging
+
 from models.oracle.attention_net import TemporalAttentionOracle
 from models.oracle.custom_loss import FocalLoss
-from sklearn.preprocessing import StandardScaler
 
+logger = logging.getLogger("Oracle_Trainer")
 
-def train_oracle_supervised(df: pd.DataFrame, save_path: str, epochs: int = 50):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Training Oracle on {device}...")
+# ==============================================================
+# 1. 3D SLIDING WINDOW DATASET
+# ==============================================================
+class SequenceDataset(Dataset):
+    """
+    Transforms flat 2D financial time-series into 3D sequential tensors.
+    """
+    def __init__(self, X: np.ndarray, y: np.ndarray, seq_len: int = 30):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.long)
+        self.seq_len = seq_len
 
-    # 1. Use the dataframe directly from the Walk-Forward pipeline
-    feature_df = df.copy()
+    def __len__(self):
+        # We lose the first `seq_len` rows because we need a full buffer to make the first prediction
+        return len(self.X) - self.seq_len
 
-    # 2. Filter out targets, timestamps, and hidden RL environment prices
-    target_col = "target"
-    exclude_cols = [target_col, "time", "datetime", "date"]
-    feature_cols = [
-        c
-        for c in feature_df.columns
-        if c not in exclude_cols and not c.startswith("env_")
-    ]
+    def __getitem__(self, idx):
+        # Extract a 30-period slice
+        X_seq = self.X[idx : idx + self.seq_len]
+        # The target is the directional outcome associated with the end of this sequence
+        y_target = self.y[idx + self.seq_len - 1]
+        
+        return X_seq, y_target
 
-    # 3. Scale the features
-    scaler = StandardScaler()
-    scaled_features = scaler.fit_transform(feature_df[feature_cols].values)
+# ==============================================================
+# 2. DATA PIPELINE PREPARATION
+# ==============================================================
+def prepare_dataloaders(df_train: pd.DataFrame, df_val: pd.DataFrame, seq_len: int, batch_size: int):
+    # Ensure standard mathematical variable naming (Ruff Whitelisted)
+    feature_cols = [c for c in df_train.columns if c not in ['target', 'time', 'datetime', 'date', 'index'] and not c.startswith("env_")]
+    
+    X_train = df_train[feature_cols].values
+    y_train = df_train['target'].values
+    
+    X_val = df_val[feature_cols].values
+    y_val = df_val['target'].values
 
-    # 4. Create the 30-period rolling windows
+    train_dataset = SequenceDataset(X_train, y_train, seq_len=seq_len)
+    val_dataset = SequenceDataset(X_val, y_val, seq_len=seq_len)
+
+    # Shuffle training data to break chronological correlation during optimization,
+    # but NEVER shuffle validation data (must remain chronological for WFA integrity)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
+
+    return train_loader, val_loader, len(feature_cols)
+
+# ==============================================================
+# 3. CORE TRAINING LOOP
+# ==============================================================
+def train_oracle_model(df_train: pd.DataFrame, df_val: pd.DataFrame, save_path: str, epochs: int = 30, device: torch.device = None):
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
     seq_len = 30
-    X, y = [], []
-    targets_raw = feature_df[target_col].values
-
-    for i in range(seq_len, len(scaled_features)):
-        X.append(scaled_features[i - seq_len : i])
-        y.append(targets_raw[i])
-
-    features_tensor = torch.FloatTensor(np.array(X)).to(device)
-    targets_tensor = torch.LongTensor(np.array(y)).to(device)
-
-    # Initialize Model & Optimizer
-    input_dim = len(feature_cols)
-    model = TemporalAttentionOracle(input_dim=input_dim, seq_len=seq_len).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=1e-4)
-    criterion = FocalLoss(gamma=2.0)
-
-    # Standard PyTorch Training Loop
-    model.train()
     batch_size = 256
-    num_batches = max(1, len(features_tensor) // batch_size)
+    
+    logger.info(f"Preparing 3D Sequential DataLoaders (Batch Size: {batch_size}, Seq Len: {seq_len})...")
+    train_loader, val_loader, input_dim = prepare_dataloaders(df_train, df_val, seq_len, batch_size)
 
-    for epoch in range(epochs):
-        epoch_loss = 0
-        correct = 0
-        total = 0
+    # Initialize Model
+    model = TemporalAttentionOracle(input_dim=input_dim, seq_len=seq_len).to(device)
+    
+    # Optimizer & Loss
+    # AdamW (Weight Decay) is strictly better than Adam for Attention/Transformer architectures
+    optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    
+    # Gamma=2.0 sharply focuses the network on the minority classes (Long/Short breakouts)
+    # Alpha dynamically weights the classes. We assume Hold=0, Long=1, Short=2.
+    class_weights = torch.tensor([0.2, 0.8, 0.8]).to(device) 
+    criterion = FocalLoss(alpha=class_weights, gamma=2.0, reduction='mean')
 
-        for i in range(0, len(features_tensor), batch_size):
-            batch_x = features_tensor[i : i + batch_size]
-            batch_y = targets_tensor[i : i + batch_size]
+    best_val_loss = float('inf')
 
+    for epoch in range(1, epochs + 1):
+        # --- TRAINING PHASE ---
+        model.train()
+        train_loss = 0.0
+        
+        for batch_X, batch_y in train_loader:
+            batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+            
             optimizer.zero_grad()
-            logits = model(batch_x)
+            logits = model(batch_X)
+            
             loss = criterion(logits, batch_y)
             loss.backward()
+            
+            # Gradient Clipping prevents exploding gradients in RNNs/GRUs
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             optimizer.step()
+            train_loss += loss.item()
+            
+        train_loss /= len(train_loader)
 
-            epoch_loss += loss.item()
+        # --- VALIDATION PHASE ---
+        model.eval()
+        val_loss = 0.0
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for batch_X, batch_y in val_loader:
+                batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+                
+                logits = model(batch_X)
+                loss = criterion(logits, batch_y)
+                val_loss += loss.item()
+                
+                # Accuracy calculation
+                predictions = torch.argmax(logits, dim=1)
+                correct += (predictions == batch_y).sum().item()
+                total += batch_y.size(0)
+                
+        val_loss /= len(val_loader)
+        val_acc = correct / total
 
-            # --- NEW: Calculate Accuracy for monitoring ---
-            _, predicted = torch.max(logits.data, 1)
-            total += batch_y.size(0)
-            correct += (predicted == batch_y).sum().item()
+        logger.info(f"Epoch {epoch}/{epochs} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
 
-        epoch_acc = 100 * correct / total if total > 0 else 0
-        print(
-            f"Epoch {epoch+1}/{epochs} | Focal Loss: {epoch_loss / num_batches:.4f} | Accuracy: {epoch_acc:.2f}%"
-        )
+        # --- CHECKPOINTING ---
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), save_path)
+            logger.info(f"⭐ New Best Model Checkpoint Saved: {save_path}")
 
-    torch.save(model.state_dict(), save_path)
-    print(f"Oracle weights saved to {save_path}")
-    return model
-
-
-# ==========================================
-# STANDALONE EXECUTION BLOCK
-# ==========================================
-if __name__ == "__main__":
-    # Define absolute paths relative to your project root
-    DATA_PATH = "data/processed/labeled_features_15m.csv"
-    SAVE_PATH = "models/oracle/best_oracle.pth"
-
-    if not os.path.exists(DATA_PATH):
-        print(f"ERROR: Master dataset not found at {DATA_PATH}.")
-        print("Please run 'python -m data.build_features' first.")
-        exit(1)
-
-    print(f"Loading V3 Master Dataset from {DATA_PATH}...")
-    master_df = pd.read_csv(DATA_PATH, parse_dates=True)
-
-    # Ensure the target directory exists before attempting to save
-    os.makedirs(os.path.dirname(SAVE_PATH), exist_ok=True)
-
-    # Trigger the training sequence
-    train_oracle_supervised(df=master_df, save_path=SAVE_PATH, epochs=150)
+    logger.info("✅ PyTorch Phase A Oracle Training Complete.")
+    return best_val_loss
