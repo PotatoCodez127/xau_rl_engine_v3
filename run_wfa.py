@@ -182,7 +182,8 @@ class WFAOrchestrator:
             # reset_num_timesteps=False prevents SB3 from resetting the learning rate schedule on resume
             manager_model.learn(total_timesteps=150_000, callback=eval_callback, reset_num_timesteps=False)
             
-            current_calmar = pd.read_csv(os.path.join(fold_manager_dir, "evaluations.npz"))['results'].mean()
+            eval_data = np.load(os.path.join(fold_manager_dir, "evaluations.npz"))
+            current_calmar = eval_data['results'].mean()
             logger.info(f"🏁 Fold {fold} Complete. Terminal Calmar Proxy: {current_calmar:.2f}")
 
             if current_calmar > best_calmar:
