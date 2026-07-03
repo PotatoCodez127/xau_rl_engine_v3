@@ -129,6 +129,11 @@ class WFAOrchestrator:
             else:
                 train_oracle_model(df_train, df_val, save_path=fold_oracle_path, epochs=30, device=self.device)
 
+            # ---> ADD THESE TWO LINES HERE <---
+            logger.info("[PHASE A] Injecting Oracle Probabilities into Environment State...")
+            df_train = inject_oracle_probs(df_train, fold_oracle_path, self.device)
+            df_val = inject_oracle_probs(df_val, fold_oracle_path, self.device)
+
             # ---------------------------------------------------------
             # PHASE B: TRAIN SAC MANAGER (EPISODIC ENVIRONMENT)
             # ---------------------------------------------------------
