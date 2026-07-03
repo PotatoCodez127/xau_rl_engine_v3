@@ -197,3 +197,21 @@ To reduce execution frequency to a realistic retail range (1–2 trades/day) and
 * **Architecture Update:** Decoupled the daily limit from the inter-trade cooldown.
 * The hard limit of **1 trade per day** is now exclusively anchored to the UTC midnight session reset.
 * The structural rolling cooldown was reduced from 96 bars (24 hours) down to **4 bars (1 hour)**, acting merely as an anti-cluster buffer to prevent the agent from firing multiple signals in the same immediate chop zone.
+
+## [V3.2] The Master-Slave Solidification (Architecture Complete)
+**Objective:** Eradicate SAC Mode Collapse, eliminate Risk Inversion, and decouple training compute from live inference.
+
+### 1. Structural Execution (Master-Slave)
+* **Phase A (Oracle):** Bidirectional GRU with Multi-Head Temporal Attention. Processes a 30-period sliding window to output directional momentum probabilities (`prob_hold`, `prob_long`, `prob_short`). 
+* **Phase B (SAC Manager):** Stripped of directional autonomy. Purely manages volumetric sizing and risk allocation based on Oracle signals.
+* **Macro Gate:** The H4 Trend (800-period 15m EMA) acts as an absolute physical gatekeeper. Counter-trend signals are deterministically blocked.
+
+### 2. Reward & Constraint Physics
+* **Action Space Asymmetry:** Continuous `[-1, 1]` arrays are scaled to guarantee a positive expectancy floor. Stop Loss is mapped to `[0.5x, 2.0x] ATR`. Take Profit is mathematically locked to `[1.0x, 3.0x]` of the chosen Stop Loss.
+* **Episodic Checkpoints:** Step-by-step inactivity penalties have been removed to prevent trade-holding paralysis. The agent is rewarded *only* upon the terminal state of a sequence (TP, SL, or EOD close), using a Calmar ratio proxy (Net PnL penalized by Account Drawdown).
+* **Imbalance Correction:** The Oracle is trained using a custom Focal Loss function (`gamma=2.0`, `alpha=[0.2, 0.8, 0.8]`) to severely penalize missed momentum breakouts and down-weight the 70% baseline market noise ("Hold" class).
+
+### 3. Hardware & Deployment Segregation
+* **The Forge (Training):** Walk-Forward Analysis (`run_wfa.py`) and all PyTorch/Stable-Baselines3 operations are permanently segregated to Google Colab T4 instances.
+* **The Battlefield (Inference):** Champion models are exported via ONNX computation graphs. The local execution environment (`main.py` + FastAPI) runs pure CPU-optimized `onnxruntime` on an Intel i5, completely detaching the live polling loop from PyTorch CUDA overhead and memory leaks.
+* **Temporal Integrity:** All WFA indices and feature engineering (`build_features.py`) enforce strict UTC alignment to physically prevent chronological data leakage.
