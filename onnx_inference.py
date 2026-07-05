@@ -1,42 +1,77 @@
+import os
+import torch
 import numpy as np
-import onnxruntime as ort
+from stable_baselines3 import SAC
+from models.oracle.attention_net import TemporalAttentionOracle
 
-class LocalInferenceEngine:
+def export_models_to_onnx(oracle_path: str, manager_path: str, output_dir: str):
     """
-    Ultra-low latency inference engine running purely on the local i5 CPU.
-    No PyTorch or SB3 dependencies.
+    Runs on Colab T4. Compiles the trained PyTorch and SB3 neural architectures 
+    into static ONNX computational graphs for your local i5 laptop.
     """
-    def __init__(self, oracle_onnx_path: str, manager_onnx_path: str):
-        print("Initializing Local ONNX Runtime Environment (i5 Optimized)...")
-        
-        # Configure ONNX to maximize local CPU thread efficiency
-        sess_options = ort.SessionOptions()
-        # Restrict to 2-4 threads to leave room for the FastAPI event loop & MT5
-        sess_options.intra_op_num_threads = 2 
-        sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    os.makedirs(output_dir, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu") 
 
-        # Load Execution Sessions natively on CPU
-        self.oracle_session = ort.InferenceSession(oracle_onnx_path, sess_options, providers=['CPUExecutionProvider'])
-        self.manager_session = ort.InferenceSession(manager_onnx_path, sess_options, providers=['CPUExecutionProvider'])
+    print(f"🚀 Initiating ONNX Compilation Pipeline on {device}...")
 
-        self.oracle_input_name = self.oracle_session.get_inputs()[0].name
-        self.manager_input_name = self.manager_session.get_inputs()[0].name
+    # --- 1. COMPILE PHASE A (THE ORACLE) ---
+    print("\n[1/2] Compiling Temporal Attention Oracle...")
+    
+    # CORRECTED: Set to match the dynamic feature count from training
+    input_dim = 39 
+    seq_len = 30
+    
+    oracle = TemporalAttentionOracle(input_dim=input_dim, seq_len=seq_len).to(device)
+    oracle.load_state_dict(torch.load(oracle_path, map_location=device))
+    oracle.eval()
 
-    def softmax(self, x: np.ndarray) -> np.ndarray:
-        e_x = np.exp(x - np.max(x))
-        return e_x / e_x.sum(axis=1, keepdims=True)
+    dummy_oracle_input = torch.randn(1, seq_len, input_dim, requires_grad=False).to(device)
+    oracle_onnx_path = os.path.join(output_dir, "oracle_v3.onnx")
 
-    def predict_oracle(self, sequence_buffer: np.ndarray) -> tuple[float, float, float]:
-        """Runs the Temporal Attention Phase A Oracle."""
-        input_tensor = np.expand_dims(sequence_buffer, axis=0).astype(np.float32)
-        logits = self.oracle_session.run(None, {self.oracle_input_name: input_tensor})[0]
-        probs = self.softmax(logits)[0]
-        return float(probs[0]), float(probs[1]), float(probs[2])
+    torch.onnx.export(
+        oracle,
+        dummy_oracle_input,
+        oracle_onnx_path,
+        export_params=True,
+        opset_version=15,          
+        do_constant_folding=True,  
+        input_names=['sequence_features'],
+        output_names=['directional_logits'],
+        dynamic_axes={'sequence_features': {0: 'batch_size'}, 'directional_logits': {0: 'batch_size'}}
+    )
+    print(f"✅ Oracle compiled successfully to: {oracle_onnx_path}")
 
-    def predict_manager(self, obs_vector: np.ndarray) -> tuple[float, float]:
-        """Runs the Distributional SAC Phase B Actor."""
-        input_tensor = np.expand_dims(obs_vector, axis=0).astype(np.float32)
-        actions = self.manager_session.run(None, {self.manager_input_name: input_tensor})[0]
-        action_array = actions[0]
-        return float(action_array[0]), float(action_array[1])
+    # --- 2. COMPILE PHASE B (THE SAC MANAGER) ---
+    print("\n[2/2] Compiling SAC Manager (Actor Policy)...")
+    
+    manager = SAC.load(manager_path, device=device)
+    actor = manager.policy.actor
+    actor.eval()
+
+    # CORRECTED: 39 features + 3 probabilities + 3 state variables = 45
+    obs_dim = 45
+    dummy_sac_input = torch.randn(1, obs_dim, requires_grad=False).to(device)
+    manager_onnx_path = os.path.join(output_dir, "manager_actor_v3.onnx")
+
+    torch.onnx.export(
+        actor,
+        dummy_sac_input,
+        manager_onnx_path,
+        export_params=True,
+        opset_version=15,
+        do_constant_folding=True,
+        input_names=['observation_vector'],
+        output_names=['continuous_actions'],
+        dynamic_axes={'observation_vector': {0: 'batch_size'}, 'continuous_actions': {0: 'batch_size'}}
+    )
+    print(f"✅ SAC Actor compiled successfully to: {manager_onnx_path}")
+    print("\n🏁 Compilation Complete. Download these files to your local i5 laptop.")
+
+if __name__ == "__main__":
+    # Point these to the Fold 4 (best calmar) paths saved in your drive
+    # Double check that these string paths perfectly match your Drive directory
+    ORACLE_WEIGHTS = "/content/drive/MyDrive/XAU_RL_V3/models/oracle/oracle_fold_4.pth"
+    MANAGER_WEIGHTS = "/content/drive/MyDrive/XAU_RL_V3/models/manager/fold_4/best_model.zip"
+    OUTPUT_DIRECTORY = "/content/drive/MyDrive/XAU_RL_V3/models/deployed"
+    
+    export_models_to_onnx(ORACLE_WEIGHTS, MANAGER_WEIGHTS, OUTPUT_DIRECTORY)

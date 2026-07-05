@@ -76,14 +76,15 @@ def train_oracle_model(df_train: pd.DataFrame, df_val: pd.DataFrame, save_path: 
     model = TemporalAttentionOracle(input_dim=input_dim, seq_len=seq_len).to(device)
     
     # Optimizer & Loss
-    # AdamW (Weight Decay) is strictly better than Adam for Attention/Transformer architectures
-    optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    # LOWERED LEARNING RATE: 3e-4 is the gold standard for Attention/Transformer stability
+    optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
     
-    # Gamma=2.0 sharply focuses the network on the minority classes (Long/Short breakouts)
-    # Alpha dynamically weights the classes. We assume Hold=0, Long=1, Short=2.
-    class_weights = torch.tensor([0.2, 0.8, 0.8]).to(device) 
-    criterion = FocalLoss(alpha=class_weights, gamma=2.0, reduction='mean')
-
+    # SOFTENED CLASS WEIGHTS: Give the "Hold" class slightly more representation 
+    # so the network isn't terrified to predict it during consolidation.
+    class_weights = torch.tensor([0.4, 1.2, 1.2]).to(device) 
+    
+    # LOWERED GAMMA: Reduce from 2.0 to 1.5 to smooth out the gradient penalty
+    criterion = FocalLoss(alpha=class_weights, gamma=1.5, reduction='mean')
     best_val_loss = float('inf')
 
     for epoch in range(1, epochs + 1):

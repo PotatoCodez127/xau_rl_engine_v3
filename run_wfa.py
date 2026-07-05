@@ -147,10 +147,29 @@ class WFAOrchestrator:
             current_model_path = os.path.join(fold_manager_dir, "best_model.zip")
             prev_model_path = os.path.join(MODEL_DIR, "manager", f"fold_{fold-1}", "best_model.zip")
 
+            # --- DYNAMIC TIMESTEP CALCULATOR SETTINGS ---
+            STEPS_PER_FOLD = 150_000
+            EVAL_FREQ = 5000
+            remaining_steps = STEPS_PER_FOLD
+
             # --- CONTINUOUS MEMORY INTEGRATION ---
             if os.path.exists(current_model_path):
                 logger.info(f"🔄 Resuming from interrupted checkpoint for Fold {fold}...")
                 manager_model = SAC.load(current_model_path, env=env_train, device=self.device)
+                
+                # Calculate exact remaining steps using the evaluation archive
+                eval_path = os.path.join(fold_manager_dir, "evaluations.npz")
+                if os.path.exists(eval_path):
+                    try:
+                        eval_data = np.load(eval_path)
+                        # Every logged evaluation represents EVAL_FREQ steps
+                        steps_completed = len(eval_data['timesteps']) * EVAL_FREQ
+                        remaining_steps = max(0, STEPS_PER_FOLD - steps_completed)
+                        logger.info(f"📊 Step Audit: {steps_completed}/{STEPS_PER_FOLD} completed before timeout.")
+                        logger.info(f"⏳ Adjusted target: Training for {remaining_steps} remaining steps.")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Could not audit evaluations.npz: {e}. Defaulting to full {STEPS_PER_FOLD} steps.")
+                        
             elif fold > 1 and os.path.exists(prev_model_path):
                 logger.info(f"🧠 Inheriting memory: Loading SAC weights from Fold {fold-1}...")
                 manager_model = SAC.load(prev_model_path, env=env_train, device=self.device)
@@ -173,15 +192,18 @@ class WFAOrchestrator:
                 env_val, 
                 best_model_save_path=fold_manager_dir,
                 log_path=fold_manager_dir, 
-                eval_freq=5000,
+                eval_freq=EVAL_FREQ,
                 deterministic=True, 
                 render=False
             )
 
-            logger.info("[PHASE B] Training SAC Manager...")
-            # reset_num_timesteps=False prevents SB3 from resetting the learning rate schedule on resume
-            manager_model.learn(total_timesteps=150_000, callback=eval_callback, reset_num_timesteps=False)
+            if remaining_steps > 0:
+                logger.info("[PHASE B] Training SAC Manager...")
+                manager_model.learn(total_timesteps=remaining_steps, callback=eval_callback, reset_num_timesteps=False)
+            else:
+                logger.info(f"✅ Fold {fold} already reached {STEPS_PER_FOLD} steps. Skipping training.")
             
+            # --- CORRECTED TERMINAL METRIC PARSING ---
             eval_data = np.load(os.path.join(fold_manager_dir, "evaluations.npz"))
             current_calmar = eval_data['results'].mean()
             logger.info(f"🏁 Fold {fold} Complete. Terminal Calmar Proxy: {current_calmar:.2f}")
@@ -205,4 +227,4 @@ class WFAOrchestrator:
 
 if __name__ == "__main__":
     orchestrator = WFAOrchestrator(data_path=DATA_PATH, n_splits=5)
-    orchestrator.run_pipeline(start_fold=2)
+    orchestrator.run_pipeline(start_fold=4)
