@@ -8,6 +8,7 @@ data/processed/*
 !data/processed/.gitkeep
 models/oracle/*.pth
 models/manager/*.zip
+models/manager/fold_*
 logs/
 tensorboard_runs/
 extract_logs.py
