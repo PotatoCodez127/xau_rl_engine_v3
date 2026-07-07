@@ -10,6 +10,8 @@ from datetime import timezone
 from stable_baselines3 import SAC
 from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.callbacks import EvalCallback, BaseCallback
+from numpy.lib.stride_tricks import sliding_window_view
+from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
 
 # Internal V3 Imports
 from env.xau_dynamic_env import XAUDynamicEnv
@@ -69,7 +71,7 @@ class ContinuityCallback(BaseCallback):
 
 
 def inject_oracle_probs(df: pd.DataFrame, oracle_path: str, device: torch.device) -> pd.DataFrame:
-    logger.info("Injecting Oracle Probabilities via Sliding Window...")
+    logger.info("Injecting Oracle Probabilities via Batched Inference...")
     
     exclude_cols = ["target", "time", "datetime", "date", "index"]
     feature_cols = [c for c in df.columns if c not in exclude_cols and not c.startswith("env_")]
@@ -79,24 +81,36 @@ def inject_oracle_probs(df: pd.DataFrame, oracle_path: str, device: torch.device
     checkpoint = torch.load(oracle_path, map_location=device)
     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
         oracle.load_state_dict(checkpoint['model_state_dict'])
-        logger.info("Successfully unpacked Oracle weights from comprehensive checkpoint dict.")
     else:
         oracle.load_state_dict(checkpoint)
-        logger.warning("Loaded Oracle weights using legacy raw state_dict format.")
     
     oracle.eval()
 
     raw_features = df[feature_cols].values
     probs_list = np.zeros((len(df), 3))
     
-    with torch.no_grad():
-        for i in range(30, len(df)):
-            window = raw_features[i - 30 : i]
-            # Copy added to suppress PyTorch non-writable array warnings
-            window_tensor = torch.FloatTensor(window.copy()).unsqueeze(0).to(device)
-            logits = oracle(window_tensor)
-            probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
-            probs_list[i] = probs
+    # Create sliding windows efficiently without looping
+    if len(raw_features) >= 30:
+        windows = sliding_window_view(raw_features, window_shape=(30, len(feature_cols))).squeeze(1)
+        
+        batch_size = 4096 # Process thousands of windows at once
+        probs_out = []
+        
+        with torch.no_grad():
+            for i in range(0, len(windows), batch_size):
+                # .copy() prevents PyTorch non-writable warnings
+                batch = torch.FloatTensor(windows[i:i + batch_size].copy()).to(device)
+                
+                # Use mixed precision for faster inference
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    logits = oracle(batch)
+                
+                probs = torch.softmax(logits, dim=1).cpu().numpy()
+                probs_out.append(probs)
+                
+        if probs_out:
+            probs_out = np.vstack(probs_out)
+            probs_list[30:30 + len(probs_out)] = probs_out
 
     df["prob_hold"] = probs_list[:, 0]
     df["prob_long"] = probs_list[:, 1]
