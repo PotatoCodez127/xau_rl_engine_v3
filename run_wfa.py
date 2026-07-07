@@ -226,5 +226,5 @@ class WFAOrchestrator:
         export_models_to_onnx(best_oracle_path, best_manager_path, DEPLOY_DIR)
 
 if __name__ == "__main__":
-    orchestrator = WFAOrchestrator(data_path=DATA_PATH, n_splits=5)
-    orchestrator.run_pipeline(start_fold=4)
+    orchestrator = WFAOrchestrator(data_path=DATA_PATH, n_splits=1)
+    orchestrator.run_pipeline(start_fold=1)
