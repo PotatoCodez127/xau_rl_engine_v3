@@ -45,7 +45,16 @@ def inject_oracle_probs(df: pd.DataFrame, oracle_path: str, device: torch.device
 
     # Initialize and load the frozen Phase A Oracle
     oracle = TemporalAttentionOracle(input_dim=len(feature_cols), seq_len=30).to(device)
-    oracle.load_state_dict(torch.load(oracle_path, map_location=device))
+    
+    # --- FIXED CHECKPOINT LOADING LOGIC ---
+    checkpoint = torch.load(oracle_path, map_location=device)
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        oracle.load_state_dict(checkpoint['model_state_dict'])
+        logger.info("Successfully unpacked Oracle weights from comprehensive checkpoint dict.")
+    else:
+        oracle.load_state_dict(checkpoint)
+        logger.warning("Loaded Oracle weights using legacy raw state_dict format.")
+    
     oracle.eval()
 
     raw_features = df[feature_cols].values
