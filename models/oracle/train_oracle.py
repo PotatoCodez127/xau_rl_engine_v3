@@ -60,7 +60,7 @@ def train_oracle_model(df_train: pd.DataFrame, df_val: pd.DataFrame, save_path: 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
     seq_len = 30
-    batch_size = 256
+    batch_size = 4096 # INCREASED: Maximize T4 VRAM utilization
     
     logger.info(f"Preparing 3D Sequential DataLoaders (Batch Size: {batch_size}, Seq Len: {seq_len})...")
     train_loader, val_loader, input_dim = prepare_dataloaders(df_train, df_val, seq_len, batch_size)
@@ -72,6 +72,9 @@ def train_oracle_model(df_train: pd.DataFrame, df_val: pd.DataFrame, save_path: 
     class_weights = torch.tensor([0.4, 1.2, 1.2]).to(device) 
     criterion = FocalLoss(alpha=class_weights, gamma=1.5, reduction='mean')
     
+    # Initialize Gradient Scaler for Mixed Precision Training
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == 'cuda'))
+    
     best_val_loss = float('inf')
     start_epoch = 1
 
@@ -80,7 +83,6 @@ def train_oracle_model(df_train: pd.DataFrame, df_val: pd.DataFrame, save_path: 
         logger.info(f"🔄 Existing checkpoint detected at {save_path}. Attempting to load...")
         try:
             checkpoint = torch.load(save_path, map_location=device)
-            # Check if this is the new dictionary format or the legacy state_dict format
             if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
                 model.load_state_dict(checkpoint['model_state_dict'])
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -92,31 +94,35 @@ def train_oracle_model(df_train: pd.DataFrame, df_val: pd.DataFrame, save_path: 
         except Exception as e:
             logger.error(f"❌ Failed to parse checkpoint: {e}")
 
-    # 1. Initialize the Gradient Scaler before the epoch loop
-    scaler = torch.cuda.amp.GradScaler()
-
     for epoch in range(start_epoch, epochs + 1):
+        # --- TRAINING PHASE ---
         model.train()
         train_loss = 0.0
         
         for batch_X, batch_y in train_loader:
             batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+            
             optimizer.zero_grad()
             
-            # 2. Wrap the forward pass and loss calculation in autocast
-            with torch.autocast(device_type='cuda', dtype=torch.float16):
+            # Use Automatic Mixed Precision (AMP) for the forward pass
+            with torch.autocast(device_type=device.type, enabled=(device.type == 'cuda'), dtype=torch.float16):
                 logits = model(batch_X)
                 loss = criterion(logits, batch_y)
-                
-            # 3. Scale the loss and step the optimizer
+            
+            # Scale loss and backpropagate
             scaler.scale(loss).backward()
+            
+            # Unscale before clipping gradients
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
+            # Step and update scaler
             scaler.step(optimizer)
             scaler.update()
             
             train_loss += loss.item()
+            
+        train_loss /= len(train_loader)
 
         # --- VALIDATION PHASE ---
         model.eval()
@@ -128,8 +134,10 @@ def train_oracle_model(df_train: pd.DataFrame, df_val: pd.DataFrame, save_path: 
             for batch_X, batch_y in val_loader:
                 batch_X, batch_y = batch_X.to(device), batch_y.to(device)
                 
-                logits = model(batch_X)
-                loss = criterion(logits, batch_y)
+                with torch.autocast(device_type=device.type, enabled=(device.type == 'cuda'), dtype=torch.float16):
+                    logits = model(batch_X)
+                    loss = criterion(logits, batch_y)
+                    
                 val_loss += loss.item()
                 
                 predictions = torch.argmax(logits, dim=1)
@@ -144,7 +152,6 @@ def train_oracle_model(df_train: pd.DataFrame, df_val: pd.DataFrame, save_path: 
         # --- CHECKPOINTING ---
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            # Save comprehensive dictionary instead of raw weights
             checkpoint_dict = {
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
