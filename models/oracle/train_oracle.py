@@ -92,26 +92,31 @@ def train_oracle_model(df_train: pd.DataFrame, df_val: pd.DataFrame, save_path: 
         except Exception as e:
             logger.error(f"❌ Failed to parse checkpoint: {e}")
 
+    # 1. Initialize the Gradient Scaler before the epoch loop
+    scaler = torch.cuda.amp.GradScaler()
+
     for epoch in range(start_epoch, epochs + 1):
-        # --- TRAINING PHASE ---
         model.train()
         train_loss = 0.0
         
         for batch_X, batch_y in train_loader:
             batch_X, batch_y = batch_X.to(device), batch_y.to(device)
-            
             optimizer.zero_grad()
-            logits = model(batch_X)
             
-            loss = criterion(logits, batch_y)
-            loss.backward()
-            
+            # 2. Wrap the forward pass and loss calculation in autocast
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                logits = model(batch_X)
+                loss = criterion(logits, batch_y)
+                
+            # 3. Scale the loss and step the optimizer
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
-            optimizer.step()
-            train_loss += loss.item()
+            scaler.step(optimizer)
+            scaler.update()
             
-        train_loss /= len(train_loader)
+            train_loss += loss.item()
 
         # --- VALIDATION PHASE ---
         model.eval()
