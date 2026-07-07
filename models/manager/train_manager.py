@@ -60,7 +60,6 @@ def train_standalone_manager(data_path: str, save_dir: str):
     # --- STATE RESUMPTION LOGIC ---
     if os.path.exists(model_path):
         logger.info(f"🔄 Existing SAC checkpoint detected at {model_path}. Attempting to load weights...")
-        # We explicitly pass the environment and device so the loaded model can continue training natively
         model = SAC.load(
             model_path,
             env=env_train,
@@ -81,7 +80,7 @@ def train_standalone_manager(data_path: str, save_dir: str):
             env_train,
             learning_rate=3e-4,
             buffer_size=200000,
-            batch_size=512,
+            batch_size=1024,     # INCREASED: For faster T4 VRAM throughput
             ent_coef='auto',     # Auto-tunes entropy to prevent premature policy convergence
             gamma=0.999,         # Long-term horizon for multi-day swing trades
             tau=0.005,           # Soft update rate for Polyak averaging
@@ -108,7 +107,6 @@ def train_standalone_manager(data_path: str, save_dir: str):
     )
 
     logger.info("Commencing SAC Neural Optimization...")
-    # Stable Baselines 3 accepts a list of callbacks
     model.learn(total_timesteps=500_000, callback=[eval_callback, buffer_callback])
     
     logger.info(f"✅ Standalone SAC Training Complete. Best model saved to {save_dir}")
