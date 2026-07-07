@@ -3,15 +3,13 @@ import gc
 import logging
 import json
 import torch
-import torch.nn.functional as F
 import numpy as np
 import pandas as pd
 from datetime import timezone
 from stable_baselines3 import SAC
 from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.callbacks import EvalCallback, BaseCallback
-from numpy.lib.stride_tricks import sliding_window_view
-from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv
 
 # Internal V3 Imports
 from env.xau_dynamic_env import XAUDynamicEnv
@@ -52,7 +50,6 @@ class ContinuityCallback(BaseCallback):
         self.buffer_path = os.path.join(fold_dir, "replay_buffer.pkl")
         self.state_path = os.path.join(fold_dir, "training_state.json")
         
-        # Initialize internal step counter from persistent state if available
         if os.path.exists(self.state_path):
             with open(self.state_path, 'r') as f:
                 self.steps_completed = json.load(f).get("steps_completed", 0)
@@ -69,9 +66,11 @@ class ContinuityCallback(BaseCallback):
                 logger.info(f"💾 Continuity Checkpoint: {self.steps_completed} steps permanently secured.")
         return True
 
-
+# ==============================================================
+# BATCHED ORACLE INFERENCE (GPU OPTIMIZED)
+# ==============================================================
 def inject_oracle_probs(df: pd.DataFrame, oracle_path: str, device: torch.device) -> pd.DataFrame:
-    logger.info("Injecting Oracle Probabilities via Batched Inference...")
+    logger.info("Injecting Oracle Probabilities via Batched Mixed-Precision Inference...")
     
     exclude_cols = ["target", "time", "datetime", "date", "index"]
     feature_cols = [c for c in df.columns if c not in exclude_cols and not c.startswith("env_")]
@@ -81,28 +80,36 @@ def inject_oracle_probs(df: pd.DataFrame, oracle_path: str, device: torch.device
     checkpoint = torch.load(oracle_path, map_location=device)
     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
         oracle.load_state_dict(checkpoint['model_state_dict'])
+        logger.info("Successfully unpacked Oracle weights.")
     else:
         oracle.load_state_dict(checkpoint)
+        logger.warning("Loaded Oracle weights using legacy format.")
     
     oracle.eval()
 
     raw_features = df[feature_cols].values
     probs_list = np.zeros((len(df), 3))
     
-    # Create sliding windows efficiently without looping
     if len(raw_features) >= 30:
-        windows = sliding_window_view(raw_features, window_shape=(30, len(feature_cols))).squeeze(1)
+        # Create sliding windows efficiently without looping (Memory View)
+        windows = np.lib.stride_tricks.sliding_window_view(raw_features, (30, len(feature_cols)))
+        windows = windows.squeeze(1) # Shape: (N - 29, 30, num_features)
         
-        batch_size = 4096 # Process thousands of windows at once
+        # Drop the last window so we only predict up to the end of the dataframe accurately
+        windows = windows[:-1] 
+        
+        batch_size = 4096 # Process thousands of windows at once to saturate T4 VRAM
         probs_out = []
         
         with torch.no_grad():
             for i in range(0, len(windows), batch_size):
-                # .copy() prevents PyTorch non-writable warnings
                 batch = torch.FloatTensor(windows[i:i + batch_size].copy()).to(device)
                 
-                # Use mixed precision for faster inference
-                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                # Use Automatic Mixed Precision for faster inference on T4 Tensor Cores
+                if device.type == 'cuda':
+                    with torch.autocast(device_type='cuda', dtype=torch.float16):
+                        logits = oracle(batch)
+                else:
                     logits = oracle(batch)
                 
                 probs = torch.softmax(logits, dim=1).cpu().numpy()
@@ -117,6 +124,14 @@ def inject_oracle_probs(df: pd.DataFrame, oracle_path: str, device: torch.device
     df["prob_short"] = probs_list[:, 2]
 
     return df
+
+# ==============================================================
+# VECTORIZED ENVIRONMENT BUILDER
+# ==============================================================
+def make_env(df_subset, init_balance):
+    def _init():
+        return XAUDynamicEnv(df=df_subset, initial_balance=init_balance)
+    return _init
 
 class WFAOrchestrator:
     def __init__(self, data_path: str, n_splits: int = 5):
@@ -133,7 +148,6 @@ class WFAOrchestrator:
         else:
             df.index = df.index.tz_convert('UTC')
         df = df.sort_index(ascending=True)
-        logger.info(f"Dataset Verified: {len(df)} rows. Chronology strictly enforced.")
         return df
 
     def generate_wfa_splits(self, df: pd.DataFrame):
@@ -158,7 +172,6 @@ class WFAOrchestrator:
 
         for fold, (train_idx, val_idx) in enumerate(splits, 1):
             if fold < start_fold:
-                logger.info(f"⏩ Skipping Fold {fold} (Already Completed).")
                 continue
 
             logger.info(f"\n{'='*40}\n🚀 INITIATING WFA FOLD {fold}/{self.n_splits}\n{'='*40}")
@@ -167,24 +180,28 @@ class WFAOrchestrator:
             df_val = df.iloc[val_idx].copy().reset_index()
             
             # --- PHASE A ---
-            logger.info("[PHASE A] Training PyTorch Oracle on Fold Data...")
             fold_oracle_path = os.path.join(MODEL_DIR, "oracle", f"oracle_fold_{fold}.pth")
             
             if os.path.exists(fold_oracle_path) and fold == start_fold:
-                logger.info(f"✅ Found existing Oracle for Fold {fold}. Skipping Phase A training...")
+                logger.info(f"✅ Found existing Oracle for Fold {fold}.")
             else:
                 train_oracle_model(df_train, df_val, save_path=fold_oracle_path, epochs=30, device=self.device)
 
-            logger.info("[PHASE A] Injecting Oracle Probabilities into Environment State...")
             df_train = inject_oracle_probs(df_train, fold_oracle_path, self.device)
             df_val = inject_oracle_probs(df_val, fold_oracle_path, self.device)
 
-            # --- PHASE B ---
-            logger.info("[PHASE B] Initializing XAU Dynamic Environment (Episodic Mode)...")
-            env_train = XAUDynamicEnv(df=df_train, initial_balance=10000.0)
-            env_val = XAUDynamicEnv(df=df_val, initial_balance=10000.0)
+            # --- PHASE B (CPU Vectorization) ---
+            logger.info("[PHASE B] Initializing Vectorized XAU Dynamic Environments...")
+            num_cpu = os.cpu_count() or 2
             
-            check_env(env_train)
+            # Run a dummy check on a single env first to satisfy Stable-Baselines API
+            dummy_check = XAUDynamicEnv(df=df_train, initial_balance=10000.0)
+            check_env(dummy_check)
+            del dummy_check
+            
+            # Deploy Vectorized Envs
+            env_train = DummyVecEnv([make_env(df_train, 10000.0) for _ in range(num_cpu)])
+            env_val = DummyVecEnv([make_env(df_val, 10000.0)]) # Validation only requires 1 env
             
             fold_manager_dir = os.path.join(MODEL_DIR, "manager", f"fold_{fold}")
             os.makedirs(fold_manager_dir, exist_ok=True)
@@ -192,40 +209,29 @@ class WFAOrchestrator:
             current_model_path = os.path.join(fold_manager_dir, "best_model.zip")
             current_buffer_path = os.path.join(fold_manager_dir, "replay_buffer.pkl")
             current_state_path = os.path.join(fold_manager_dir, "training_state.json")
-            
             prev_model_path = os.path.join(MODEL_DIR, "manager", f"fold_{fold-1}", "best_model.zip")
             prev_buffer_path = os.path.join(MODEL_DIR, "manager", f"fold_{fold-1}", "replay_buffer.pkl")
 
             STEPS_PER_FOLD = 150_000
-            EVAL_FREQ = 5000
+            EVAL_FREQ = max(1000, 5000 // num_cpu) # Scale evaluation frequency by number of cores
             remaining_steps = STEPS_PER_FOLD
 
             if os.path.exists(current_model_path):
-                logger.info(f"🔄 Resuming from interrupted checkpoint for Fold {fold}...")
+                logger.info(f"🔄 Resuming checkpoint for Fold {fold}...")
                 manager_model = SAC.load(current_model_path, env=env_train, device=self.device)
-                
-                # Load Buffer
                 if os.path.exists(current_buffer_path):
                     manager_model.load_replay_buffer(current_buffer_path)
-                    logger.info("📥 Fold Replay Buffer Restored.")
                 
-                # Calculate True Remaining Steps via JSON State
                 if os.path.exists(current_state_path):
                     with open(current_state_path, 'r') as f:
                         steps_completed = json.load(f).get("steps_completed", 0)
                         remaining_steps = max(0, STEPS_PER_FOLD - steps_completed)
-                        logger.info(f"📊 State Audit: {steps_completed}/{STEPS_PER_FOLD} verified via persistent tracker.")
-                        logger.info(f"⏳ Adjusted target: Training for {remaining_steps} remaining steps.")
-                else:
-                    logger.warning("⚠️ No training_state.json found. Defaulting to full step count to prevent undertraining.")
                         
             elif fold > 1 and os.path.exists(prev_model_path):
-                logger.info(f"🧠 Inheriting memory: Loading SAC weights from Fold {fold-1}...")
+                logger.info(f"🧠 Inheriting SAC weights from Fold {fold-1}...")
                 manager_model = SAC.load(prev_model_path, env=env_train, device=self.device)
-                
                 if os.path.exists(prev_buffer_path):
                     manager_model.load_replay_buffer(prev_buffer_path)
-                    logger.info("📥 Inherited Replay Buffer from previous fold.")
             else:
                 logger.info("🌱 Initializing blank SAC Manager...")
                 manager_model = SAC(
@@ -233,7 +239,7 @@ class WFAOrchestrator:
                     env_train, 
                     learning_rate=3e-4,
                     buffer_size=100000,
-                    batch_size=256,
+                    batch_size=1024, # INCREASED from 256 for faster T4 VRAM throughput
                     ent_coef='auto',
                     gamma=0.99,
                     tau=0.005,
@@ -241,7 +247,6 @@ class WFAOrchestrator:
                     verbose=0
                 )
 
-            # Callbacks
             eval_callback = EvalCallback(
                 env_val, 
                 best_model_save_path=fold_manager_dir,
@@ -252,9 +257,7 @@ class WFAOrchestrator:
             )
             
             continuity_callback = ContinuityCallback(
-                fold_dir=fold_manager_dir,
-                save_freq=EVAL_FREQ,
-                verbose=1
+                fold_dir=fold_manager_dir, save_freq=EVAL_FREQ, verbose=1
             )
 
             if remaining_steps > 0:
@@ -264,19 +267,16 @@ class WFAOrchestrator:
                     callback=[eval_callback, continuity_callback], 
                     reset_num_timesteps=False
                 )
-                # Final memory seal when loop naturally concludes
                 manager_model.save_replay_buffer(current_buffer_path)
             else:
-                logger.info(f"✅ Fold {fold} already reached {STEPS_PER_FOLD} steps. Skipping training.")
+                logger.info(f"✅ Fold {fold} already reached {STEPS_PER_FOLD} steps.")
             
-            # Metric Parsing (Only attempt if eval exists, gracefully handle missing array on instant-skips)
             try:
                 eval_data = np.load(os.path.join(fold_manager_dir, "evaluations.npz"))
                 current_calmar = eval_data['results'].mean()
                 logger.info(f"🏁 Fold {fold} Complete. Terminal Calmar Proxy: {current_calmar:.2f}")
-            except Exception as e:
+            except Exception:
                 current_calmar = -1.0
-                logger.warning("No evaluation history available to calculate Calmar Proxy.")
 
             if current_calmar > best_calmar:
                 best_calmar = current_calmar
@@ -288,10 +288,8 @@ class WFAOrchestrator:
             torch.cuda.empty_cache()
 
         logger.info(f"\n{'='*40}\n🎉 WFA COMPLETE. Best Calmar: {best_calmar:.2f}\n{'='*40}")
-        logger.info("Executing Phase C: Exporting champion models to ONNX for i5 Deployment...")
-        
         export_models_to_onnx(best_oracle_path, best_manager_path, DEPLOY_DIR)
 
 if __name__ == "__main__":
-    orchestrator = WFAOrchestrator(data_path=DATA_PATH, n_splits=1)
+    orchestrator = WFAOrchestrator(data_path=DATA_PATH, n_splits=5)
     orchestrator.run_pipeline(start_fold=1)
