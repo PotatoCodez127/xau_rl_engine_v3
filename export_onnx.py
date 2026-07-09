@@ -7,7 +7,7 @@ from models.oracle.attention_net import TemporalAttentionOracle
 def export_models_to_onnx(oracle_path: str, manager_path: str, output_dir: str):
     """
     Runs on Colab T4. Compiles the trained PyTorch and SB3 neural architectures 
-    into static ONNX computational graphs for your local i5 laptop.
+    into static ONNX computational graphs for your local laptop.
     """
     os.makedirs(output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu") 
@@ -16,24 +16,28 @@ def export_models_to_onnx(oracle_path: str, manager_path: str, output_dir: str):
 
     # --- 1. COMPILE PHASE A (THE ORACLE) ---
     print("\n[1/2] Compiling Temporal Attention Oracle...")
-    input_dim = 25 # Core feature dimension
     seq_len = 30
     
-    oracle = TemporalAttentionOracle(input_dim=input_dim, seq_len=seq_len).to(device)
-    
-    # --- FIXED CHECKPOINT LOADING LOGIC ---
+    # --- DYNAMIC DIMENSION RESOLUTION ---
     checkpoint = torch.load(oracle_path, map_location=device)
+    
     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-        oracle.load_state_dict(checkpoint['model_state_dict'])
+        state_dict = checkpoint['model_state_dict']
         print("✅ Successfully unpacked Oracle weights from comprehensive checkpoint dict.")
     else:
-        oracle.load_state_dict(checkpoint)
+        state_dict = checkpoint
         print("⚠️ Loaded Oracle weights using legacy raw state_dict format.")
-        
+
+    # Dynamically infer input_dim from the GRU weight matrix shape: [hidden_size, input_dim]
+    inferred_input_dim = state_dict['gru.weight_ih_l0'].shape[1]
+    print(f"🔍 Dynamically inferred Oracle input dimension: {inferred_input_dim}")
+    
+    oracle = TemporalAttentionOracle(input_dim=inferred_input_dim, seq_len=seq_len).to(device)
+    oracle.load_state_dict(state_dict)
     oracle.eval()
 
     # Create dummy tensor matching the shape
-    dummy_oracle_input = torch.randn(1, seq_len, input_dim, requires_grad=False).to(device)
+    dummy_oracle_input = torch.randn(1, seq_len, inferred_input_dim, requires_grad=False).to(device)
     oracle_onnx_path = os.path.join(output_dir, "oracle_v3.onnx")
 
     torch.onnx.export(
@@ -56,9 +60,11 @@ def export_models_to_onnx(oracle_path: str, manager_path: str, output_dir: str):
     actor = manager.policy.actor
     actor.eval()
 
-    # Obs_Dim = 25 features + 3 probs + 3 state variables = 31
-    obs_dim = 31
-    dummy_sac_input = torch.randn(1, obs_dim, requires_grad=False).to(device)
+    # Dynamically infer obs_dim from the loaded manager's observation space
+    inferred_obs_dim = manager.observation_space.shape[0]
+    print(f"🔍 Dynamically inferred SAC Manager observation dimension: {inferred_obs_dim}")
+
+    dummy_sac_input = torch.randn(1, inferred_obs_dim, requires_grad=False).to(device)
     manager_onnx_path = os.path.join(output_dir, "manager_actor_v3.onnx")
 
     torch.onnx.export(
@@ -77,8 +83,8 @@ def export_models_to_onnx(oracle_path: str, manager_path: str, output_dir: str):
 
 if __name__ == "__main__":
     # Point these to your Google Drive Colab paths
-    ORACLE_WEIGHTS = "/content/drive/MyDrive/XAU_RL_V3/models/oracle/best_oracle.pth"
-    MANAGER_WEIGHTS = "/content/drive/MyDrive/XAU_RL_V3/models/manager/saved/wfa_43/best_model.zip"
+    ORACLE_WEIGHTS = "/content/drive/MyDrive/XAU_RL_V3/models/oracle/oracle_fold_5.pth" # Update to your champion fold path
+    MANAGER_WEIGHTS = "/content/drive/MyDrive/XAU_RL_V3/models/manager/fold_5/best_model.zip" # Update to your champion fold path
     OUTPUT_DIRECTORY = "/content/drive/MyDrive/XAU_RL_V3/models/deployed"
     
     export_models_to_onnx(ORACLE_WEIGHTS, MANAGER_WEIGHTS, OUTPUT_DIRECTORY)
