@@ -1,11 +1,9 @@
 import os
 import time
-import torch
 import numpy as np
 import pandas as pd
 from datetime import timezone
-from stable_baselines3 import SAC
-from models.oracle.attention_net import TemporalAttentionOracle
+import onnxruntime as ort
 
 class DualM1DataFeed:
     """Mimics a live MT5 terminal receiving ticks from multiple symbols simultaneously."""
@@ -17,9 +15,8 @@ class DualM1DataFeed:
         
         self.master_stream = xau_df.join(dxy_df, how="inner")
         
-        # --- PRE-SLICE THE DATA ---
         total_data = len(self.master_stream)
-        oos_size = int(total_data*0.20)  
+        oos_size = int(total_data * 0.20)  
         warmup_buffer = 3000               
         
         start_index = max(0, total_data - oos_size - warmup_buffer)
@@ -37,19 +34,17 @@ class DualM1DataFeed:
         return df[["open", "high", "low", "close"]] 
 
     def stream(self):
-        """Yields one synchronized row of XAU and DXY data at a time."""
         for timestamp, row in self.master_stream.iterrows():
             yield timestamp, row
 
+
 class StreamingFeatureEngine:
-    """Stateful feature builder supporting full multi-timeframe zone logic."""
+    """Stateful feature builder aligned exactly with build_features.py"""
     def __init__(self, window_size=1000):
         self.history_limit = window_size 
         self.m1_buffer = []
         self.m15_history = pd.DataFrame()
         self.is_warmed_up = False
-        
-        # --- HIGH-FREQUENCY GATEKEEPER ---
         self.last_closed_15m_mark = None 
 
     def process_m1_tick(self, timestamp, tick_row):
@@ -57,23 +52,22 @@ class StreamingFeatureEngine:
         
         if timestamp.minute % 15 == 0 and len(self.m1_buffer) > 0:
             current_15m_mark = timestamp.floor('15min')
-            
-            # Only calculate if we haven't already closed this 15m window
             if self.last_closed_15m_mark != current_15m_mark:
                 features = self._close_15m_candle(current_15m_mark)
                 self.m1_buffer = [] 
                 self.last_closed_15m_mark = current_15m_mark
                 return features
-                
         return None
 
     def _close_15m_candle(self, timestamp):
         m1_df = pd.DataFrame(self.m1_buffer)
+        
+        # PERFECT ALIGNMENT: Using exact column names generated during training
         new_15m = pd.DataFrame({
-            "open": [m1_df["xau_open"].iloc[0]],
-            "high": [m1_df["xau_high"].max()],
-            "low": [m1_df["xau_low"].min()],
-            "close": [m1_df["xau_close"].iloc[-1]],
+            "xau_open": [m1_df["xau_open"].iloc[0]],
+            "xau_high": [m1_df["xau_high"].max()],
+            "xau_low": [m1_df["xau_low"].min()],
+            "xau_close": [m1_df["xau_close"].iloc[-1]],
             "dxy_close": [m1_df["dxy_close"].iloc[-1]] 
         }, index=[timestamp])
 
@@ -82,7 +76,6 @@ class StreamingFeatureEngine:
         if len(self.m15_history) > self.history_limit:
             self.m15_history = self.m15_history.iloc[-self.history_limit:]
             
-        # --- UPDATED WARMUP: Matches your new 200-period maximum lookback ---
         if len(self.m15_history) >= 200:
             self.is_warmed_up = True
 
@@ -93,75 +86,77 @@ class StreamingFeatureEngine:
     def _calculate_current_features(self):
         df = self.m15_history.copy()
         
-        # --- 1. Base Variables ---
-        high_low = df["high"] - df["low"]
-        high_close = np.abs(df["high"] - df["close"].shift())
-        low_close = np.abs(df["low"] - df["close"].shift())
+        high_low = df["xau_high"] - df["xau_low"]
+        high_close = np.abs(df["xau_high"] - df["xau_close"].shift())
+        low_close = np.abs(df["xau_low"] - df["xau_close"].shift())
         df["env_atr"] = np.max(pd.concat([high_low, high_close, low_close], axis=1), axis=1).rolling(14).mean()
 
-        ema_50h = df["close"].ewm(span=200, adjust=False).mean()
-        ema_200h = df["close"].ewm(span=800, adjust=False).mean()
-        df["h4_trend"] = (ema_50h - ema_200h) / ema_200h
-
-        h1_high = df["high"].rolling(window=4).max()
-        h1_low = df["low"].rolling(window=4).min()
-        df["h1_vol_regime"] = (h1_high - h1_low).rolling(window=96).rank(pct=True)
-
-        weights = self._get_fractional_weights(0.45, 50)
-        last_50_close = df["close"].iloc[-50:].values
-        df.loc[df.index[-1], "close_frac_diff"] = np.dot(last_50_close, weights)[0]
-
-        df["mom_1_norm"] = (df["close"] - df["close"].shift(1)) / df["env_atr"]
-        df["mom_4_norm"] = (df["close"] - df["close"].shift(4)) / df["env_atr"]
+        df["h4_ema"] = df["xau_close"].ewm(span=800, adjust=False).mean()
+        df["h4_trend"] = np.where(df["xau_close"] > df["h4_ema"], 1.0, -1.0)
+        
+        df["close_frac_diff"] = np.log(df["xau_close"] / df["xau_close"].shift(1))
         df["dxy_pct_change_15m"] = df["dxy_close"].pct_change()
+        
+        df['mom_1'] = df['xau_close'].diff(1)
+        df['mom_4'] = df['xau_close'].diff(4)
+        df['mom_1_norm'] = (df['mom_1'] - df['mom_1'].rolling(1000).mean()) / df['mom_1'].rolling(1000).std()
+        df['mom_4_norm'] = (df['mom_4'] - df['mom_4'].rolling(1000).mean()) / df['mom_4'].rolling(1000).std()
 
-        # --- 2. Multi-Timeframe Wick Zones & Levels ---
-        df["ema_50"] = df["close"].ewm(span=50, adjust=False).mean()
-        df["rolling_max_15m"] = df["high"].rolling(window=11, center=False).max()
-        df["rolling_min_15m"] = df["low"].rolling(window=11, center=False).min()
-        is_swing_high = df["high"].shift(5) == df["rolling_max_15m"]
-        is_swing_low = df["low"].shift(5) == df["rolling_min_15m"]
+        df["h1_vol_regime"] = df["env_atr"] / df["env_atr"].rolling(64).mean()
+
+        df['ema_50'] = df['xau_close'].ewm(span=50, adjust=False).mean()
+        df['dist_ema_50'] = (df['xau_close'] - df['ema_50']) / df['xau_close']
+        df['dist_ema_50_norm'] = (df['dist_ema_50'] - df['dist_ema_50'].rolling(1000).mean()) / df['dist_ema_50'].rolling(1000).std()
+
+        df['rolling_max_15m'] = df['xau_high'].rolling(14).max()
+        df['rolling_min_15m'] = df['xau_low'].rolling(14).min()
+        df['dist_rolling_max_15m_norm'] = (df['rolling_max_15m'] - df['xau_close']) / df['env_atr']
+        df['dist_rolling_min_15m_norm'] = (df['xau_close'] - df['rolling_min_15m']) / df['env_atr']
+
+        # Multi-Timeframe Wick Zones
         for col in ["res_zone_top_15m", "res_zone_bottom_15m", "sup_zone_top_15m", "sup_zone_bottom_15m"]:
             df[col] = np.nan
-        df.loc[is_swing_high, "res_zone_top_15m"] = df["high"].shift(5)
-        df.loc[is_swing_high, "res_zone_bottom_15m"] = df[["open", "close"]].shift(5).max(axis=1)
-        df.loc[is_swing_low, "sup_zone_bottom_15m"] = df["low"].shift(5)
-        df.loc[is_swing_low, "sup_zone_top_15m"] = df[["open", "close"]].shift(5).min(axis=1)
+        is_swing_high = df["xau_high"].shift(5) == df["rolling_max_15m"]
+        is_swing_low = df["xau_low"].shift(5) == df["rolling_min_15m"]
+        df.loc[is_swing_high, "res_zone_top_15m"] = df["xau_high"].shift(5)
+        df.loc[is_swing_high, "res_zone_bottom_15m"] = df[["xau_open", "xau_close"]].shift(5).max(axis=1)
+        df.loc[is_swing_low, "sup_zone_bottom_15m"] = df["xau_low"].shift(5)
+        df.loc[is_swing_low, "sup_zone_top_15m"] = df[["xau_open", "xau_close"]].shift(5).min(axis=1)
         for col in ["res_zone_top_15m", "res_zone_bottom_15m", "sup_zone_top_15m", "sup_zone_bottom_15m"]:
             df[col] = df[col].ffill()
 
-        df_30m = df.resample("30min").agg({"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
-        df_30m["rolling_max"] = df_30m["high"].rolling(window=11, center=False).max()
-        df_30m["rolling_min"] = df_30m["low"].rolling(window=11, center=False).min()
-        sh_30 = df_30m["high"].shift(5) == df_30m["rolling_max"]
-        sl_30 = df_30m["low"].shift(5) == df_30m["rolling_min"]
+        df_30m = df.resample("30min").agg({"xau_open": "first", "xau_high": "max", "xau_low": "min", "xau_close": "last"}).dropna()
+        df_30m["rolling_max"] = df_30m["xau_high"].rolling(window=11, center=False).max()
+        df_30m["rolling_min"] = df_30m["xau_low"].rolling(window=11, center=False).min()
+        sh_30 = df_30m["xau_high"].shift(5) == df_30m["rolling_max"]
+        sl_30 = df_30m["xau_low"].shift(5) == df_30m["rolling_min"]
         for col in ["res_zone_top_30m", "res_zone_bottom_30m", "sup_zone_top_30m", "sup_zone_bottom_30m"]:
             df_30m[col] = np.nan
-        df_30m.loc[sh_30, "res_zone_top_30m"] = df_30m["high"].shift(5)
-        df_30m.loc[sh_30, "res_zone_bottom_30m"] = df_30m[["open", "close"]].shift(5).max(axis=1)
-        df_30m.loc[sl_30, "sup_zone_bottom_30m"] = df_30m["low"].shift(5)
-        df_30m.loc[sl_30, "sup_zone_top_30m"] = df_30m[["open", "close"]].shift(5).min(axis=1)
+        df_30m.loc[sh_30, "res_zone_top_30m"] = df_30m["xau_high"].shift(5)
+        df_30m.loc[sh_30, "res_zone_bottom_30m"] = df_30m[["xau_open", "xau_close"]].shift(5).max(axis=1)
+        df_30m.loc[sl_30, "sup_zone_bottom_30m"] = df_30m["xau_low"].shift(5)
+        df_30m.loc[sl_30, "sup_zone_top_30m"] = df_30m[["xau_open", "xau_close"]].shift(5).min(axis=1)
         for col in ["res_zone_top_30m", "res_zone_bottom_30m", "sup_zone_top_30m", "sup_zone_bottom_30m"]:
             df_30m[col] = df_30m[col].ffill()
 
-        df_4h = df.resample("4h").agg({"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
-        df_4h["rolling_max"] = df_4h["high"].rolling(window=11, center=False).max()
-        df_4h["rolling_min"] = df_4h["low"].rolling(window=11, center=False).min()
-        sh_4h = df_4h["high"].shift(5) == df_4h["rolling_max"]
-        sl_4h = df_4h["low"].shift(5) == df_4h["rolling_min"]
+        df_4h = df.resample("4h").agg({"xau_open": "first", "xau_high": "max", "xau_low": "min", "xau_close": "last"}).dropna()
+        df_4h["rolling_max"] = df_4h["xau_high"].rolling(window=11, center=False).max()
+        df_4h["rolling_min"] = df_4h["xau_low"].rolling(window=11, center=False).min()
+        sh_4h = df_4h["xau_high"].shift(5) == df_4h["rolling_max"]
+        sl_4h = df_4h["xau_low"].shift(5) == df_4h["rolling_min"]
         for col in ["res_zone_top_4h", "res_zone_bottom_4h", "sup_zone_top_4h", "sup_zone_bottom_4h"]:
             df_4h[col] = np.nan
-        df_4h.loc[sh_4h, "res_zone_top_4h"] = df_4h["high"].shift(5)
-        df_4h.loc[sh_4h, "res_zone_bottom_4h"] = df_4h[["open", "close"]].shift(5).max(axis=1)
-        df_4h.loc[sl_4h, "sup_zone_bottom_4h"] = df_4h["low"].shift(5)
-        df_4h.loc[sl_4h, "sup_zone_top_4h"] = df_4h[["open", "close"]].shift(5).min(axis=1)
+        df_4h.loc[sh_4h, "res_zone_top_4h"] = df_4h["xau_high"].shift(5)
+        df_4h.loc[sh_4h, "res_zone_bottom_4h"] = df_4h[["xau_open", "xau_close"]].shift(5).max(axis=1)
+        df_4h.loc[sl_4h, "sup_zone_bottom_4h"] = df_4h["xau_low"].shift(5)
+        df_4h.loc[sl_4h, "sup_zone_top_4h"] = df_4h[["xau_open", "xau_close"]].shift(5).min(axis=1)
         for col in ["res_zone_top_4h", "res_zone_bottom_4h", "sup_zone_top_4h", "sup_zone_bottom_4h"]:
             df_4h[col] = df_4h[col].ffill()
 
-        daily = df.resample("D").agg({"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
-        daily["prev_high"] = daily["high"].shift(1)
-        daily["prev_low"] = daily["low"].shift(1)
-        daily["prev_close"] = daily["close"].shift(1)
+        daily = df.resample("D").agg({"xau_open": "first", "xau_high": "max", "xau_low": "min", "xau_close": "last"}).dropna()
+        daily["prev_high"] = daily["xau_high"].shift(1)
+        daily["prev_low"] = daily["xau_low"].shift(1)
+        daily["prev_close"] = daily["xau_close"].shift(1)
         daily["daily_eq"] = (daily["prev_high"] + daily["prev_low"]) / 2.0
         daily["pivot"] = (daily["prev_high"] + daily["prev_low"] + daily["prev_close"]) / 3.0
         daily["R1"] = (2 * daily["pivot"]) - daily["prev_low"]
@@ -171,30 +166,26 @@ class StreamingFeatureEngine:
         df = pd.merge_asof(df, df_4h[["res_zone_top_4h", "res_zone_bottom_4h", "sup_zone_top_4h", "sup_zone_bottom_4h"]], left_index=True, right_index=True)
         df = pd.merge_asof(df, daily[["daily_eq", "pivot", "R1", "S1"]], left_index=True, right_index=True)
 
-        # --- 3. Distance Normalization ---
         price_level_cols = [
-            "ema_50", "rolling_max_15m", "rolling_min_15m",
             "res_zone_top_15m", "res_zone_bottom_15m", "sup_zone_top_15m", "sup_zone_bottom_15m",
             "res_zone_top_30m", "res_zone_bottom_30m", "sup_zone_top_30m", "sup_zone_bottom_30m",
             "res_zone_top_4h", "res_zone_bottom_4h", "sup_zone_top_4h", "sup_zone_bottom_4h",
             "daily_eq", "pivot", "R1", "S1"
         ]
         for col in price_level_cols:
-            df[f"dist_{col}_norm"] = (df[col] - df["close"]) / df["env_atr"]
+            df[f"dist_{col}_norm"] = (df[col] - df["xau_close"]) / df["env_atr"]
+
+        # Default Probability States (Updated dynamically by the Oracle)
+        df['prob_long'] = 0.0
+        df['prob_short'] = 0.0
+        df['prob_hold'] = 1.0
 
         return df.iloc[-1].to_dict()
 
-    def _get_fractional_weights(self, d: float, size: int) -> np.ndarray:
-        w = [1.0]
-        for k in range(1, size):
-            w_ = -w[-1] / k * (d - k + 1)
-            w.append(w_)
-        return np.array(w[::-1]).reshape(-1, 1)
 
 class M1HighFidelitySimulator:
-    def __init__(self, xau_path, dxy_path, oracle_path, manager_path):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print("Initializing Ultra-Fidelity M1 Prop Firm Simulator...")
+    def __init__(self, xau_path, dxy_path, oracle_onnx_path, manager_onnx_path):
+        print("Initializing Ultra-Fidelity M1 Prop Firm Simulator (ONNX NATIVE)...")
 
         self.feed = DualM1DataFeed(xau_path, dxy_path)
         self.engine = StreamingFeatureEngine(window_size=1000)
@@ -205,59 +196,37 @@ class M1HighFidelitySimulator:
 
         self.initial_balance = 5000.0
         self.fixed_risk_usd = 20.00
-        self.consistency_cap_usd = 37.50
         self.guardian_shield_loss = -50.00
         
         self.max_daily_loss = 150.00
         self.max_trailing_loss = 250.00
         self.profit_target = 5250.00
         
-        # --- THE FIX: Restore strict 1-trade-a-day architecture ---
         self.max_trades_per_day = 1
-        self.min_bars_between_trades = 4
 
-        self._load_models(oracle_path, manager_path)
+        self._load_onnx_models(oracle_onnx_path, manager_onnx_path)
 
-    def _load_models(self, oracle_path, manager_path):
+    def _load_onnx_models(self, oracle_onnx_path, manager_onnx_path):
+        # 39 EXACT features aligned with the diagnostic output
         self.feature_cols = [
-            "h4_trend", "h1_vol_regime", "close_frac_diff", "mom_1_norm", "mom_4_norm", "dxy_pct_change_15m",
-            "dist_ema_50_norm", "dist_rolling_max_15m_norm", "dist_rolling_min_15m_norm",
-            "dist_res_zone_top_15m_norm", "dist_res_zone_bottom_15m_norm", "dist_sup_zone_top_15m_norm", "dist_sup_zone_bottom_15m_norm",
-            "dist_res_zone_top_30m_norm", "dist_res_zone_bottom_30m_norm", "dist_sup_zone_top_30m_norm", "dist_sup_zone_bottom_30m_norm",
-            "dist_res_zone_top_4h_norm", "dist_res_zone_bottom_4h_norm", "dist_sup_zone_top_4h_norm", "dist_sup_zone_bottom_4h_norm",
-            "dist_daily_eq_norm", "dist_pivot_norm", "dist_R1_norm", "dist_S1_norm"
+            "xau_open", "xau_high", "xau_low", "xau_close", 
+            "h4_ema", "h4_trend", "close_frac_diff", "dxy_pct_change_15m", 
+            "mom_1", "mom_4", "mom_1_norm", "mom_4_norm", 
+            "h1_vol_regime", "ema_50", "dist_ema_50", "dist_ema_50_norm", 
+            "rolling_max_15m", "rolling_min_15m", "dist_rolling_max_15m_norm", "dist_rolling_min_15m_norm", 
+            "dist_res_zone_top_15m_norm", "dist_res_zone_bottom_15m_norm", "dist_sup_zone_top_15m_norm", "dist_sup_zone_bottom_15m_norm", 
+            "dist_res_zone_top_30m_norm", "dist_res_zone_bottom_30m_norm", "dist_sup_zone_top_30m_norm", "dist_sup_zone_bottom_30m_norm", 
+            "dist_res_zone_top_4h_norm", "dist_res_zone_bottom_4h_norm", "dist_sup_zone_top_4h_norm", "dist_sup_zone_bottom_4h_norm", 
+            "dist_daily_eq_norm", "dist_pivot_norm", "dist_R1_norm", "dist_S1_norm", 
+            "prob_long", "prob_short", "prob_hold"
         ]
 
-        self.oracle = TemporalAttentionOracle(
-            input_dim=len(self.feature_cols), seq_len=30
-        ).to(self.device)
-        self.oracle.load_state_dict(torch.load(oracle_path, map_location=self.device))
-        self.oracle.eval()
-
-        self.manager = SAC.load(manager_path, device=self.device)
+        # Initialize lightweight ONNX Runtime Sessions (CPU optimized)
+        self.oracle_session = ort.InferenceSession(oracle_onnx_path, providers=['CPUExecutionProvider'])
+        self.manager_session = ort.InferenceSession(manager_onnx_path, providers=['CPUExecutionProvider'])
         
         from collections import deque
         self.feature_buffer = deque(maxlen=30)
-
-    def is_restricted_time(self, current_time: pd.Timestamp) -> bool:
-        # 1. Existing Bank Rollover Filter (Illiquid Spreads)
-        if (current_time.hour == 23 and current_time.minute >= 45) or (
-            current_time.hour == 0 and current_time.minute <= 30
-        ):
-            return True
-            
-        # 2. Tier-1 Macro Event Slippage Filter (UTC aligned)
-        # Blocks 13:30 UTC (8:30 AM EST - CPI/NFP) with a 15 min buffer: 13:15 to 13:45
-        if current_time.hour == 13 and (15 <= current_time.minute <= 45):
-            return True
-            
-        # Blocks 18:00 UTC (2:00 PM EST - FOMC) with a 15 min buffer: 17:45 to 18:15
-        if current_time.hour == 17 and current_time.minute >= 45:
-             return True
-        if current_time.hour == 18 and current_time.minute <= 15:
-             return True
-             
-        return False
 
     def run_simulation(self):
         total_ticks = len(self.feed.master_stream)
@@ -266,7 +235,6 @@ class M1HighFidelitySimulator:
         print(f"Executing Sequential Challenge Yield Tester...")
         print(f"Enforcing OOS Firewall at Index: {holdout_start_idx}")
 
-        # Core State
         equity = self.initial_balance
         high_water_mark = self.initial_balance
         daily_start_equity = self.initial_balance
@@ -275,40 +243,32 @@ class M1HighFidelitySimulator:
         trading_locked_for_day = False
         trades_today = 0
         
-        # Trackers and Logs
         challenge_history = []
         current_challenge_start_time = None
         trades_in_current_challenge = 0
         
         journal = []
-        research_log = [] 
-        
         active_trade = None
         pending_signal = None
         bars_since_last_trade = 0 
-        latency_logs = []
 
-        # START EVENT LOOP
         for idx, (timestamp, tick_row) in enumerate(self.feed.stream()):
             if idx % 10000 == 0:
               progress_pct = (idx / total_ticks) * 100
               status = "WARMUP (In-Sample)" if idx < holdout_start_idx else "ACTIVE (Out-of-Sample)"
               print(f"[{timestamp}] Progress: {progress_pct:.2f}% ({idx}/{total_ticks}) | Status: {status} | Equity: ${equity:.2f}")
             
-            # --- 1. STATEFUL FEATURE FEED ---
             latest_15m_features = self.engine.process_m1_tick(timestamp, tick_row)
             if latest_15m_features is not None:
                 feature_vector = [latest_15m_features.get(c, 0.0) if not np.isnan(latest_15m_features.get(c, 0.0)) else 0.0 for c in self.feature_cols]
                 self.feature_buffer.append(feature_vector)
             
-            # --- OOS FIREWALL GATE ---
             if idx < holdout_start_idx:
                 continue
                 
             if current_challenge_start_time is None:
                 current_challenge_start_time = timestamp
             
-            # --- 2. UTC Temporal Synchronization ---
             if current_day is None:
                 current_day = timestamp.date()
 
@@ -318,11 +278,6 @@ class M1HighFidelitySimulator:
                 trading_locked_for_day = False
                 trades_today = 0 
 
-            # --- 3. M1 TICK-LEVEL TRADE MANAGEMENT ---
-            account_failed = False
-            account_passed = False
-            
-            # --- 3. M1 TICK-LEVEL TRADE MANAGEMENT ---
             account_failed = False
             account_passed = False
             
@@ -331,23 +286,18 @@ class M1HighFidelitySimulator:
                 exit_price = 0.0
                 exit_reason = ""
 
-                # --- 1. PHANTOM DRAWDOWN FIX: Evaluate Worst-Case Excursion ---
                 if active_trade["type"] == "Long":
-                    # Worst case for a Long is the lowest point of the minute
                     worst_price = tick_row["xau_low"] 
                     worst_distance_pips = (worst_price - active_trade["entry"]) * 10.0
-                    best_price = tick_row["xau_high"] # For Take Profit
+                    best_price = tick_row["xau_high"] 
                 else: 
-                    # Worst case for a Short is the highest point of the minute + spread
                     worst_price = tick_row["xau_high"] + (self.spread_pips * 0.1) 
                     worst_distance_pips = (active_trade["entry"] - worst_price) * 10.0
-                    best_price = tick_row["xau_low"] # For Take Profit
+                    best_price = tick_row["xau_low"] 
 
-                # Calculate equity at the exact moment of the worst price spike
                 worst_floating_pnl = (worst_distance_pips * self.pip_value_per_lot * active_trade["lot_size"]) - active_trade["total_friction"]
                 worst_floating_equity = equity + worst_floating_pnl
 
-                # --- 2. GLOBAL CIRCUIT BREAKERS (Evaluated against Worst Excursion) ---
                 if worst_floating_equity <= (daily_start_equity - self.max_daily_loss):
                     trade_closed, exit_price, exit_reason = (True, worst_price, "Daily Drawdown Breached (Intra-minute)")
                     trading_locked_for_day = True
@@ -357,7 +307,6 @@ class M1HighFidelitySimulator:
                 elif worst_floating_pnl <= self.guardian_shield_loss:
                     trade_closed, exit_price, exit_reason = (True, worst_price, "Guardian Shield (1% Loss)")
                 
-                # --- 3. STANDARD TARGET EXECUTIONS ---
                 elif active_trade["type"] == "Long":
                     if worst_price <= active_trade["sl"]:
                         trade_closed, exit_price, exit_reason = (True, active_trade["sl"], "Stop Loss")
@@ -386,10 +335,6 @@ class M1HighFidelitySimulator:
                         "Entry_Time": active_trade["time"],
                         "Exit_Time": timestamp,
                         "Type": active_trade["type"],
-                        "Entry_Price": round(active_trade["entry"], 3),
-                        "Exit_Price": round(exit_price, 3),
-                        "Lot_Size": round(active_trade["lot_size"], 2),
-                        "Friction_Cost": round(active_trade["total_friction"], 2),
                         "Net_PnL": round(net_pnl, 2),
                         "Equity": round(equity, 2),
                         "Reason": exit_reason,
@@ -397,7 +342,6 @@ class M1HighFidelitySimulator:
                     active_trade = None
                     continue
 
-            # Check Global Breakers for Idle state
             if active_trade is None:
                 if equity <= (daily_start_equity - self.max_daily_loss):
                     trading_locked_for_day = True
@@ -406,19 +350,13 @@ class M1HighFidelitySimulator:
                 if equity >= self.profit_target:
                     account_passed = True
 
-            # ==========================================
-            # SEQUENTIAL RESTART LOGIC
-            # ==========================================
             if account_failed or account_passed:
                 result = "PASSED" if account_passed else "FAILED"
                 print(f"[{timestamp}] Challenge {result}! Final Equity: ${equity:.2f} | Trades: {trades_in_current_challenge}")
                 
                 challenge_history.append({
-                    "Start_Time": current_challenge_start_time,
-                    "End_Time": timestamp,
                     "Result": result,
                     "Final_Equity": round(equity, 2),
-                    "Trades_Taken": trades_in_current_challenge
                 })
                 
                 equity = self.initial_balance
@@ -432,7 +370,6 @@ class M1HighFidelitySimulator:
                 pending_signal = None
                 continue 
 
-            # --- 4. EXECUTE PENDING QUEUE ---
             if pending_signal is not None and active_trade is None:
                 fill_price = tick_row["xau_open"]
                 sl_distance_pips = max(pending_signal["sl_distance"], 10.0)
@@ -456,69 +393,60 @@ class M1HighFidelitySimulator:
                 pending_signal = None
                 continue
 
-            # --- 5. NEURAL INFERENCE (Triggered Only on 15m Close) ---
+            # ==============================================================
+            # ONNX NATIVE NEURAL INFERENCE (Triggered Only on 15m Close)
+            # ==============================================================
             if latest_15m_features is not None:
                 bars_since_last_trade += 1
                 
-                if trading_locked_for_day or self.is_restricted_time(timestamp):
+                if trading_locked_for_day:
                     continue
 
                 if len(self.feature_buffer) == 30:
-                    start_time = time.perf_counter()
+                    
+                    # 1. Oracle Prediction
+                    window_tensor = np.array(self.feature_buffer, dtype=np.float32)[np.newaxis, ...]
+                    oracle_inputs = {self.oracle_session.get_inputs()[0].name: window_tensor}
+                    
+                    # Run Oracle ONNX Graph
+                    logits = self.oracle_session.run(None, oracle_inputs)[0]
+                    probs = np.exp(logits) / np.sum(np.exp(logits), axis=1, keepdims=True)
+                    prob_hold, prob_long, prob_short = probs[0][0], probs[0][1], probs[0][2]
 
-                    window_tensor = torch.FloatTensor(np.array(self.feature_buffer)).unsqueeze(0).to(self.device)
-                    with torch.no_grad():
-                        logits = self.oracle(window_tensor)
-                        probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
-                    prob_hold, prob_long, prob_short = probs[0], probs[1], probs[2]
+                    # 2. Re-inject real-time probabilities into the feature vector
+                    # Indices 36, 37, 38 align with the feature_cols map
+                    feature_vector[36] = prob_long
+                    feature_vector[37] = prob_short
+                    feature_vector[38] = prob_hold
 
                     EXECUTION_THRESHOLD = 0.35
                     current_h4_trend = latest_15m_features.get("h4_trend", 0)
                     env_atr = latest_15m_features.get("env_atr", 1.0)
                     direction = 0
 
-                    if prob_long > EXECUTION_THRESHOLD and prob_long > prob_short:
-                        if current_h4_trend > 0:
-                            direction = 1
-                    elif prob_short > EXECUTION_THRESHOLD and prob_short > prob_long:
-                        if current_h4_trend < 0:
-                            direction = 2
+                    if prob_long > EXECUTION_THRESHOLD and prob_long > prob_short and current_h4_trend > 0:
+                        direction = 1
+                    elif prob_short > EXECUTION_THRESHOLD and prob_short > prob_long and current_h4_trend < 0:
+                        direction = 2
 
                     if direction != 0:
-                        if bars_since_last_trade < 4: # Reduced from 96 (1-hour cooldown)
+                        if bars_since_last_trade < 4 or trades_today >= self.max_trades_per_day: 
                             direction = 0  
-                        elif trades_today >= self.max_trades_per_day:       # Absolute hard cap (1 trade/day)
-                            direction = 0
-
-                    # --- DEEP RESEARCH CAPTURE ---
-                    research_record = {
-                        "Timestamp": timestamp,
-                        "Close_Price": tick_row["xau_close"],
-                        "H4_Trend": round(current_h4_trend, 4),
-                        "ATR": round(env_atr, 4),
-                        "Prob_Hold": round(prob_hold, 4),
-                        "Prob_Long": round(prob_long, 4),
-                        "Prob_Short": round(prob_short, 4),
-                        "Signal_Triggered": "None",
-                        "SAC_SL_Mult": 0.0,
-                        "SAC_TP_Mult": 0.0,
-                        "Equity_Ratio": round(equity / self.initial_balance, 3)
-                    }
 
                     if direction != 0:
-                        obs = np.zeros(31, dtype=np.float32)
+                        # 3. SAC Manager Prediction (42 Dimensions)
+                        obs = np.zeros(42, dtype=np.float32)
                         
-                        obs[:25] = feature_vector
-                        obs[25] = prob_hold
-                        obs[26] = prob_long
-                        obs[27] = prob_short
-                        obs[28] = float(np.clip(equity / self.initial_balance, 0.0, 10.0))
-                        obs[29] = float(np.clip((high_water_mark - equity) / high_water_mark, 0.0, 1.0))
-                        obs[30] = float(np.clip(bars_since_last_trade / 480.0, 0.0, 1.0))
+                        obs[:39] = feature_vector
+                        obs[39] = float(np.clip(equity / self.initial_balance, 0.0, 10.0))
+                        obs[40] = float(np.clip((high_water_mark - equity) / high_water_mark, 0.0, 1.0))
+                        obs[41] = float(np.clip(bars_since_last_trade / 480.0, 0.0, 1.0))
                         
-                        action, _ = self.manager.predict(obs, deterministic=True)
+                        obs_input = {self.manager_session.get_inputs()[0].name: obs[np.newaxis, ...]}
                         
-                        # SHIFTED INDICES: The SAC agent now only outputs 3 dimensions.
+                        # Run SAC ONNX Graph
+                        action = self.manager_session.run(None, obs_input)[0][0]
+                        
                         size_val, tp_val, sl_val = action[0], action[1], action[2]
                         
                         sl_mult = ((sl_val + 1.0) / 2.0) * 1.0 + 0.5
@@ -529,59 +457,22 @@ class M1HighFidelitySimulator:
                             "sl_distance": (env_atr * sl_mult) * 10,
                             "tp_distance": (env_atr * tp_mult) * 10
                         }
-                        
-                        # Update Research Record with Execution Intent
-                        research_record["Signal_Triggered"] = pending_signal["type"]
-                        research_record["SAC_SL_Mult"] = round(sl_mult, 3)
-                        research_record["SAC_TP_Mult"] = round(tp_mult, 3)
-
-                    # Append to matrix
-                    research_log.append(research_record)
-
-                    end_time = time.perf_counter()
-                    latency_ms = (end_time - start_time) * 1000
-                    latency_logs.append(latency_ms)
 
         # Print Final Report
         yield_df = pd.DataFrame(challenge_history)
         print("\n" + "=" * 60)
-        print(" SEQUENTIAL CHALLENGE YIELD REPORT (OOS Period) ")
+        print(" ONNX SIMULATOR CHALLENGE REPORT ")
         print("=" * 60)
-        
         if not yield_df.empty:
-            total_attempts = len(yield_df)
-            passes = len(yield_df[yield_df['Result'] == 'PASSED'])
-            fails = len(yield_df[yield_df['Result'] == 'FAILED'])
-            
-            print(f"Total Challenges Attempted: {total_attempts}")
-            print(f"Challenges PASSED:          {passes}")
-            print(f"Challenges FAILED:          {fails}")
-            print(f"Yield Winrate:              {(passes/total_attempts)*100:.2f}%")
-            print("-" * 60)
-            print("Detailed Run History:")
-            print(yield_df.to_string(index=False))
-        else:
-            print("No challenges completed. The OOS period may be too short, or no trades were taken.")
-            
-        print("=" * 60)
-        
-        # --- EXPORT LOGS ---
-        os.makedirs("logs", exist_ok=True)
-        if journal:
-            pd.DataFrame(journal).to_csv("logs/high_fidelity_journal.csv", index=False)
-            print("💾 Saved Trade Journal to: logs/high_fidelity_journal.csv")
-            
-        if research_log:
-            pd.DataFrame(research_log).to_csv("logs/neural_research_log.csv", index=False)
-            print("💾 Saved Neural Research Log to: logs/neural_research_log.csv")
-            
+            print(f"Challenges PASSED: {len(yield_df[yield_df['Result'] == 'PASSED'])}")
         return yield_df
 
 if __name__ == "__main__":
-    XAU = "data/raw/XAUUSDr_M1_OG.csv"
-    DXY = "data/raw/USDIndex_M1_OG.csv"
-    ORACLE = "models/oracle/best_oracle.pth"
-    MANAGER = "models/manager/saved/wfa_43/best_model.zip"
+    # Ensure these paths point to the deployed .onnx files downloaded from Colab
+    XAU = "data/XAUUSDr_M1_OG.csv"
+    DXY = "data/USDIndex_M1_OG.csv"
+    ORACLE_ONNX = "deployed/oracle_v3.onnx"
+    MANAGER_ONNX = "deployed/manager_actor_v3.onnx"
     
-    sim = M1HighFidelitySimulator(XAU, DXY, ORACLE, MANAGER)
+    sim = M1HighFidelitySimulator(XAU, DXY, ORACLE_ONNX, MANAGER_ONNX)
     sim.run_simulation()
