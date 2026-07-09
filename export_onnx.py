@@ -4,6 +4,23 @@ import numpy as np
 from stable_baselines3 import SAC
 from models.oracle.attention_net import TemporalAttentionOracle
 
+class OnnxableSACActor(torch.nn.Module):
+    """
+    Wraps the SB3 SAC Actor to bypass the stochastic probability distributions (torch.distributions.Normal).
+    This forces the ONNX tracer to only compile the deterministic feed-forward mathematical path,
+    avoiding data-dependent control flow exceptions.
+    """
+    def __init__(self, actor):
+        super().__init__()
+        self.actor = actor
+
+    def forward(self, observation):
+        features = self.actor.extract_features(observation)
+        latent_pi = self.actor.latent_pi(features)
+        mean_actions = self.actor.mu(latent_pi)
+        # SAC bounds actions between -1 and 1 using tanh
+        return torch.tanh(mean_actions)
+
 def export_models_to_onnx(oracle_path: str, manager_path: str, output_dir: str):
     """
     Runs on Colab T4. Compiles the trained PyTorch and SB3 neural architectures 
@@ -18,7 +35,6 @@ def export_models_to_onnx(oracle_path: str, manager_path: str, output_dir: str):
     print("\n[1/2] Compiling Temporal Attention Oracle...")
     seq_len = 30
     
-    # --- DYNAMIC DIMENSION RESOLUTION ---
     checkpoint = torch.load(oracle_path, map_location=device)
     
     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
@@ -28,7 +44,6 @@ def export_models_to_onnx(oracle_path: str, manager_path: str, output_dir: str):
         state_dict = checkpoint
         print("⚠️ Loaded Oracle weights using legacy raw state_dict format.")
 
-    # Dynamically infer input_dim from the GRU weight matrix shape: [hidden_size, input_dim]
     inferred_input_dim = state_dict['gru.weight_ih_l0'].shape[1]
     print(f"🔍 Dynamically inferred Oracle input dimension: {inferred_input_dim}")
     
@@ -36,7 +51,6 @@ def export_models_to_onnx(oracle_path: str, manager_path: str, output_dir: str):
     oracle.load_state_dict(state_dict)
     oracle.eval()
 
-    # Create dummy tensor matching the shape
     dummy_oracle_input = torch.randn(1, seq_len, inferred_input_dim, requires_grad=False).to(device)
     oracle_onnx_path = os.path.join(output_dir, "oracle_v3.onnx")
 
@@ -57,10 +71,11 @@ def export_models_to_onnx(oracle_path: str, manager_path: str, output_dir: str):
     print("\n[2/2] Compiling SAC Manager (Actor Policy)...")
     
     manager = SAC.load(manager_path, device=device)
-    actor = manager.policy.actor
-    actor.eval()
+    
+    # Wrap the actor to force deterministic mathematical tracing
+    onnxable_actor = OnnxableSACActor(manager.policy.actor)
+    onnxable_actor.eval()
 
-    # Dynamically infer obs_dim from the loaded manager's observation space
     inferred_obs_dim = manager.observation_space.shape[0]
     print(f"🔍 Dynamically inferred SAC Manager observation dimension: {inferred_obs_dim}")
 
@@ -68,7 +83,7 @@ def export_models_to_onnx(oracle_path: str, manager_path: str, output_dir: str):
     manager_onnx_path = os.path.join(output_dir, "manager_actor_v3.onnx")
 
     torch.onnx.export(
-        actor,
+        onnxable_actor,
         dummy_sac_input,
         manager_onnx_path,
         export_params=True,
@@ -82,9 +97,8 @@ def export_models_to_onnx(oracle_path: str, manager_path: str, output_dir: str):
     print("\n🏁 Compilation Complete. Download these files to your local laptop.")
 
 if __name__ == "__main__":
-    # Point these to your Google Drive Colab paths
-    ORACLE_WEIGHTS = "/content/drive/MyDrive/XAU_RL_V3/models/oracle/oracle_fold_5.pth" # Update to your champion fold path
-    MANAGER_WEIGHTS = "/content/drive/MyDrive/XAU_RL_V3/models/manager/fold_5/best_model.zip" # Update to your champion fold path
+    ORACLE_WEIGHTS = "/content/drive/MyDrive/XAU_RL_V3/models/oracle/oracle_fold_5.pth" 
+    MANAGER_WEIGHTS = "/content/drive/MyDrive/XAU_RL_V3/models/manager/fold_5/best_model.zip" 
     OUTPUT_DIRECTORY = "/content/drive/MyDrive/XAU_RL_V3/models/deployed"
     
     export_models_to_onnx(ORACLE_WEIGHTS, MANAGER_WEIGHTS, OUTPUT_DIRECTORY)
