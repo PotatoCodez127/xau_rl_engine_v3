@@ -15,7 +15,8 @@ class OnnxableSACActor(torch.nn.Module):
         self.actor = actor
 
     def forward(self, observation):
-        features = self.actor.extract_features(observation)
+        # FIX: Explicitly pass the features_extractor module alongside the observation
+        features = self.actor.extract_features(observation, self.actor.features_extractor)
         latent_pi = self.actor.latent_pi(features)
         mean_actions = self.actor.mu(latent_pi)
         # SAC bounds actions between -1 and 1 using tanh
