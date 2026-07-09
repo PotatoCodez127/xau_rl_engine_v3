@@ -469,10 +469,10 @@ class M1HighFidelitySimulator:
 
 if __name__ == "__main__":
     # Ensure these paths point to the deployed .onnx files downloaded from Colab
-    XAU = "data/XAUUSDr_M1_OG.csv"
-    DXY = "data/USDIndex_M1_OG.csv"
-    ORACLE_ONNX = "deployed/oracle_v3.onnx"
-    MANAGER_ONNX = "deployed/manager_actor_v3.onnx"
+    XAU = "data/raw/XAUUSDr_M1_OG.csv"
+    DXY = "data/raw/USDIndex_M1_OG.csv"
+    ORACLE_ONNX = "models/deployed/oracle_v3.onnx"
+    MANAGER_ONNX = "models/deployed/manager_actor_v3.onnx"
     
     sim = M1HighFidelitySimulator(XAU, DXY, ORACLE_ONNX, MANAGER_ONNX)
     sim.run_simulation()
