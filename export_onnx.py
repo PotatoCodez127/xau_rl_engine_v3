@@ -10,7 +10,6 @@ def export_models_to_onnx(oracle_path: str, manager_path: str, output_dir: str):
     into static ONNX computational graphs for your local i5 laptop.
     """
     os.makedirs(output_dir, exist_ok=True)
-    # Load onto the T4 GPU for the trace
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu") 
 
     print(f"🚀 Initiating ONNX Compilation Pipeline on {device}...")
@@ -21,7 +20,16 @@ def export_models_to_onnx(oracle_path: str, manager_path: str, output_dir: str):
     seq_len = 30
     
     oracle = TemporalAttentionOracle(input_dim=input_dim, seq_len=seq_len).to(device)
-    oracle.load_state_dict(torch.load(oracle_path, map_location=device))
+    
+    # --- FIXED CHECKPOINT LOADING LOGIC ---
+    checkpoint = torch.load(oracle_path, map_location=device)
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        oracle.load_state_dict(checkpoint['model_state_dict'])
+        print("✅ Successfully unpacked Oracle weights from comprehensive checkpoint dict.")
+    else:
+        oracle.load_state_dict(checkpoint)
+        print("⚠️ Loaded Oracle weights using legacy raw state_dict format.")
+        
     oracle.eval()
 
     # Create dummy tensor matching the shape
@@ -65,7 +73,7 @@ def export_models_to_onnx(oracle_path: str, manager_path: str, output_dir: str):
         dynamic_axes={'observation_vector': {0: 'batch_size'}, 'continuous_actions': {0: 'batch_size'}}
     )
     print(f"✅ SAC Actor compiled successfully to: {manager_onnx_path}")
-    print("\n🏁 Compilation Complete. Download these files to your local i5 laptop.")
+    print("\n🏁 Compilation Complete. Download these files to your local laptop.")
 
 if __name__ == "__main__":
     # Point these to your Google Drive Colab paths
