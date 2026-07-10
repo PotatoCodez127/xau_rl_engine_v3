@@ -3,46 +3,68 @@ import json
 import os
 import requests
 from datetime import datetime, timezone, timedelta
+from filelock import FileLock # Added for atomic ASGI thread-safety
 
 class WhatsAppCopilot:
+    """
+    Refactored: Implemented Atomic POSIX File Locking. 
+    Guarantees thread-safe telemetry state management across concurrent ASGI workers.
+    """
     def __init__(self):
         self.api_url = os.getenv("WHATSAPP_API_URL")
         self.token = os.getenv("WHATSAPP_TOKEN")
         self.headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
         
         self.db_file = "subscribers.json"
+        self.lock_file = f"{self.db_file}.lock"
+        self.lock = FileLock(self.lock_file, timeout=5.0) # 5-second queue timeout
+        
         self.window_limit = timedelta(hours=24)
         self.reminder_threshold = timedelta(hours=23, minutes=30)
         self.subscribers = self.load_subscribers()
 
     def load_subscribers(self):
-        """Loads JSON and converts stored ISO strings back to datetime objects."""
-        if os.path.exists(self.db_file):
-            try:
-                with open(self.db_file, 'r') as f:
-                    data = json.load(f)
-                    # Convert strings back to datetime objects
-                    return {k: datetime.fromisoformat(v) for k, v in data.items()}
-            except Exception as e:
-                print(f"[Storage] Error loading JSON: {e}")
-        return {}
+        """Loads JSON atomically and converts stored ISO strings back to datetime objects."""
+        with self.lock:
+            if os.path.exists(self.db_file):
+                try:
+                    with open(self.db_file, 'r') as f:
+                        data = json.load(f)
+                        return {k: datetime.fromisoformat(v) for k, v in data.items()}
+                except Exception as e:
+                    print(f"[Storage] Error loading JSON: {e}")
+            return {}
 
     def save_subscribers(self):
-        """Saves current state, converting datetime objects to ISO strings."""
-        with open(self.db_file, 'w') as f:
-            # Convert datetime objects to ISO strings for JSON storage
-            data_to_save = {k: v.isoformat() for k, v in self.subscribers.items()}
-            json.dump(data_to_save, f)
+        """Saves current state atomically, converting datetime objects to ISO strings."""
+        with self.lock:
+            with open(self.db_file, 'w') as f:
+                data_to_save = {k: v.isoformat() for k, v in self.subscribers.items()}
+                json.dump(data_to_save, f)
 
     def update_interaction(self, phone_number: str):
-        """Called via FastAPI webhook when a user sends a message."""
-        self.subscribers[phone_number] = datetime.now(timezone.utc)
-        self.save_subscribers()
+        """
+        Called via FastAPI webhook when a user sends a message.
+        Forces an atomic read-modify-write sequence to prevent ASGI race conditions.
+        """
+        with self.lock:
+            # 1. Re-sync in-memory state in case another worker updated the file
+            self.subscribers = self.load_subscribers() 
+            
+            # 2. Modify State
+            self.subscribers[phone_number] = datetime.now(timezone.utc)
+            
+            # 3. Write to Disk
+            self.save_subscribers()
+            
         print(f"[WhatsApp] Window refreshed for {phone_number}.")
         self._send_message(phone_number, "System Synced. You are actively receiving XAU Live Signals.")
 
     def broadcast_signal(self, signal_data: dict):
         """Sends the trading signal to all users within the open window."""
+        # Refresh state prior to broadcast to ensure accuracy
+        self.subscribers = self.load_subscribers()
+        
         now = datetime.now(timezone.utc)
         active_users = [
             num for num, last_time in self.subscribers.items()
@@ -62,6 +84,8 @@ class WhatsAppCopilot:
 
     def check_and_send_reminders(self):
         """Runs periodically to warn users their window is closing."""
+        self.subscribers = self.load_subscribers()
+        
         now = datetime.now(timezone.utc)
         for num, last_time in self.subscribers.items():
             elapsed = now - last_time
