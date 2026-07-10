@@ -7,11 +7,13 @@ class XAUDynamicEnv(gym.Env):
     """
     XAUUSD Master-Slave Execution Environment (V3.2).
     Phase A (Oracle) strictly dictates direction. Phase B (SAC Manager) exclusively dictates sizing.
+    Refactored: AOT C-contiguous memory allocation to eliminate Pandas CPU bottleneck.
     """
     def __init__(self, df: pd.DataFrame, initial_balance=10000.0):
         super(XAUDynamicEnv, self).__init__()
         
-        self.df = df.reset_index()
+        # Drop index to ensure clean integer row mapping downstream
+        self.df = df.reset_index(drop=True) 
         self.initial_balance = initial_balance
         self.friction_cost = 10.0
 
@@ -20,20 +22,31 @@ class XAUDynamicEnv(gym.Env):
         self.max_trades_per_day = 1       # Prop-firm frequency survival constraint
         
         # --- ACTION SPACE ASYMMETRY BINDING ---
-        # Action Space Reduced to 2 Dimensions: [Stop Loss Multiplier, Take Profit Multiplier]
-        # Bounded continuously between -1.0 and 1.0 for Stable-Baselines3 SAC gradient stability.
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
 
         # Feature Pipeline
         exclude_cols = ["target", "time", "datetime", "date", "index"]
         self.feature_cols = [
-            c for c in df.columns if c not in exclude_cols and not c.startswith("env_")
+            c for c in self.df.columns if c not in exclude_cols and not c.startswith("env_")
         ]
 
-        # Observation Space: Features + Oracle Probabilities + Account State Vectors
+        # Observation Space
         self.observation_space = spaces.Box(
             low=-10.0, high=10.0, shape=(len(self.feature_cols) + 3,), dtype=np.float32
         )
+
+        # --- AOT MEMORY ALLOCATION (Zero-Overhead NumPy Arrays) ---
+        # Matrix for rapid _get_obs() slicing
+        self.features_mat = np.ascontiguousarray(self.df[self.feature_cols].values, dtype=np.float32)
+        
+        # Fast-access 1D vectors for step() logic
+        self.dates_arr = pd.to_datetime(self.df["datetime"]).dt.date.values
+        self.prob_long_arr = np.ascontiguousarray(self.df["prob_long"].values, dtype=np.float32)
+        self.prob_short_arr = np.ascontiguousarray(self.df["prob_short"].values, dtype=np.float32)
+        self.prob_hold_arr = np.ascontiguousarray(self.df["prob_hold"].values, dtype=np.float32)
+        self.h4_trend_arr = np.ascontiguousarray(self.df["h4_trend"].values, dtype=np.float32)
+        
+        self.max_steps = len(self.features_mat) - 1
 
         # State Variables
         self.current_step = 30
@@ -41,7 +54,7 @@ class XAUDynamicEnv(gym.Env):
         self.peak_balance = self.initial_balance
         self.bars_since_last_trade = 0
         self.trades_today = 0
-        self.current_day = pd.to_datetime(self.df.loc[self.current_step, "datetime"]).date()
+        self.current_day = self.dates_arr[self.current_step]
 
     def reset(self, seed=None, options=None):
         """Resets the environment for the next WFA training epoch."""
@@ -51,13 +64,15 @@ class XAUDynamicEnv(gym.Env):
         self.peak_balance = self.initial_balance
         self.bars_since_last_trade = 0
         self.trades_today = 0
-        self.current_day = pd.to_datetime(self.df.loc[self.current_step, "datetime"]).date()
+        self.current_day = self.dates_arr[self.current_step]
         return self._get_obs(), {}
 
     def _get_obs(self):
         """Builds the 1D Tensor state observation for the SAC Agent."""
         obs = np.zeros(self.observation_space.shape[0], dtype=np.float32)
-        X = self.df.loc[self.current_step, self.feature_cols].values
+        
+        # Zero-overhead C-level array slicing
+        X = self.features_mat[self.current_step]
         obs[: len(X)] = X
 
         # Account Health Vectors
@@ -96,22 +111,22 @@ class XAUDynamicEnv(gym.Env):
         return 0
 
     def step(self, action):
-        step_time = pd.to_datetime(self.df.loc[self.current_step, "datetime"])
+        step_date = self.dates_arr[self.current_step]
         
         # Automated CI Runner Temporal Synchronization (UTC)
-        if step_time.date() > self.current_day:
-            self.current_day = step_time.date()
+        if step_date > self.current_day:
+            self.current_day = step_date
             self.trades_today = 0
 
         # Unpack and bound the action space
         sl_mult_used, tp_mult_ratio = self._scale_action(action)
         tp_mult_used = sl_mult_used * tp_mult_ratio 
 
-        # Oracle Master-Slave Logic Extraction
-        prob_long = self.df.loc[self.current_step, "prob_long"]
-        prob_short = self.df.loc[self.current_step, "prob_short"]
-        prob_hold = self.df.loc[self.current_step, "prob_hold"]
-        h4_trend = self.df.loc[self.current_step, "h4_trend"]
+        # Oracle Master-Slave Logic Extraction (O(1) Array Indexing)
+        prob_long = self.prob_long_arr[self.current_step]
+        prob_short = self.prob_short_arr[self.current_step]
+        prob_hold = self.prob_hold_arr[self.current_step]
+        h4_trend = self.h4_trend_arr[self.current_step]
         
         direction = self._evaluate_master_slave_trigger(prob_long, prob_short, prob_hold, h4_trend)
 
@@ -123,7 +138,6 @@ class XAUDynamicEnv(gym.Env):
         self.bars_since_last_trade += 1
         
         # --- EPISODIC REWARD ENGINEERING ---
-        # Base reward is zero. No step-by-step inactivity penalties.
         reward = 0.0  
 
         if direction != 0:
@@ -132,8 +146,6 @@ class XAUDynamicEnv(gym.Env):
             
             # Dynamic Compounding: Fixed 1.5% Risk Protocol
             amount_at_risk = self.balance * 0.015
-
-            # Instant theoretical resolution for training speed
             prob_win = prob_long if direction == 1 else prob_short
 
             if np.random.rand() < prob_win:
@@ -146,8 +158,6 @@ class XAUDynamicEnv(gym.Env):
             self.peak_balance = max(max(self.initial_balance, self.peak_balance), self.balance)
             
             # --- TERMINAL CALMAR REWARD PROXY ---
-            # The agent is only graded upon the conclusion of a trade.
-            # Reward structurally optimizes for highest net PnL relative to induced Account Drawdown.
             drawdown = (self.peak_balance - self.balance) / self.peak_balance
             drawdown_penalty = drawdown * self.initial_balance * 0.25
             
@@ -159,7 +169,7 @@ class XAUDynamicEnv(gym.Env):
         # Check termination conditions (Account Blown)
         self.current_step += 1
         terminated = self.balance < (self.initial_balance * 0.1)
-        truncated = self.current_step >= len(self.df) - 1
+        truncated = self.current_step >= self.max_steps
 
         info = {
             "prob_long": prob_long,
