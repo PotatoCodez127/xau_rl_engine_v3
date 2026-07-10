@@ -9,7 +9,7 @@ from datetime import timezone
 from stable_baselines3 import SAC
 from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.callbacks import EvalCallback, BaseCallback
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
 # Internal V3 Imports
 from env.xau_dynamic_env import XAUDynamicEnv
@@ -91,21 +91,16 @@ def inject_oracle_probs(df: pd.DataFrame, oracle_path: str, device: torch.device
     probs_list = np.zeros((len(df), 3))
     
     if len(raw_features) >= 30:
-        # Create sliding windows efficiently without looping (Memory View)
         windows = np.lib.stride_tricks.sliding_window_view(raw_features, (30, len(feature_cols)))
-        windows = windows.squeeze(1) # Shape: (N - 29, 30, num_features)
-        
-        # Drop the last window so we only predict up to the end of the dataframe accurately
+        windows = windows.squeeze(1) 
         windows = windows[:-1] 
         
-        batch_size = 4096 # Process thousands of windows at once to saturate T4 VRAM
+        batch_size = 4096 
         probs_out = []
         
         with torch.no_grad():
             for i in range(0, len(windows), batch_size):
                 batch = torch.FloatTensor(windows[i:i + batch_size].copy()).to(device)
-                
-                # Use Automatic Mixed Precision for faster inference on T4 Tensor Cores
                 if device.type == 'cuda':
                     with torch.autocast(device_type='cuda', dtype=torch.float16):
                         logits = oracle(batch)
@@ -190,18 +185,19 @@ class WFAOrchestrator:
             df_train = inject_oracle_probs(df_train, fold_oracle_path, self.device)
             df_val = inject_oracle_probs(df_val, fold_oracle_path, self.device)
 
-            # --- PHASE B (CPU Vectorization) ---
+            # --- PHASE B (True Multi-Core Parallelization) ---
             logger.info("[PHASE B] Initializing Vectorized XAU Dynamic Environments...")
             num_cpu = os.cpu_count() or 2
             
-            # Run a dummy check on a single env first to satisfy Stable-Baselines API
             dummy_check = XAUDynamicEnv(df=df_train, initial_balance=10000.0)
             check_env(dummy_check)
             del dummy_check
             
-            # Deploy Vectorized Envs
-            env_train = DummyVecEnv([make_env(df_train, 10000.0) for _ in range(num_cpu)])
-            env_val = DummyVecEnv([make_env(df_val, 10000.0)]) # Validation only requires 1 env
+            # SubprocVecEnv spawns independent OS processes, shattering the Python GIL constraint
+            env_train = SubprocVecEnv([make_env(df_train, 10000.0) for _ in range(num_cpu)])
+            
+            # Validation remains DummyVecEnv to avoid IPC overhead since it requires only 1 env
+            env_val = DummyVecEnv([make_env(df_val, 10000.0)]) 
             
             fold_manager_dir = os.path.join(MODEL_DIR, "manager", f"fold_{fold}")
             os.makedirs(fold_manager_dir, exist_ok=True)
@@ -213,7 +209,7 @@ class WFAOrchestrator:
             prev_buffer_path = os.path.join(MODEL_DIR, "manager", f"fold_{fold-1}", "replay_buffer.pkl")
 
             STEPS_PER_FOLD = 150_000
-            EVAL_FREQ = max(1000, 5000 // num_cpu) # Scale evaluation frequency by number of cores
+            EVAL_FREQ = max(1000, 5000 // num_cpu)
             remaining_steps = STEPS_PER_FOLD
 
             if os.path.exists(current_model_path):
@@ -239,7 +235,7 @@ class WFAOrchestrator:
                     env_train, 
                     learning_rate=3e-4,
                     buffer_size=100000,
-                    batch_size=1024, # INCREASED from 256 for faster T4 VRAM throughput
+                    batch_size=1024,
                     ent_coef='auto',
                     gamma=0.99,
                     tau=0.005,
