@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-import pandas_ta as ta
+import pandas_ta_classic as ta
 import logging
 
 logger = logging.getLogger("Feature_Pipeline")
@@ -135,8 +135,8 @@ def build_xau_features(df_raw: pd.DataFrame) -> pd.DataFrame:
     return df
 
 if __name__ == "__main__":
-    RAW_DATA_PATH = "/content/drive/MyDrive/XAU_RL_V3/data/raw/xauusd_1m.csv" 
-    OUT_PATH = "/content/drive/MyDrive/XAU_RL_V3/data/processed_features.parquet"
+    RAW_DATA_PATH = "data/raw/XAUUSDr_M1_OG.csv" 
+    OUT_PATH = "data/processed_features.parquet"
     
     try:
         raw_df = pd.read_csv(RAW_DATA_PATH, sep=None, engine='python')
