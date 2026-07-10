@@ -8,6 +8,7 @@ pyarrow>=15.0.0
 
 # --- Deep Learning (Phase A Oracle - Colab Training) ---
 torch>=2.1.0
+pyarrow
 
 # --- Reinforcement Learning (Phase B Manager - Colab Training) ---
 gymnasium==0.29.1
