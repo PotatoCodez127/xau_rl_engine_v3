@@ -32,12 +32,16 @@ def aggregate_m1_to_m15(df_raw: pd.DataFrame) -> pd.DataFrame:
 
 def rolling_z_score(series: pd.Series, window: int = 500, eps: float = 1e-8) -> pd.Series:
     """
-    Robust Standardization: Normalizes continuous variables against macro regime shifts 
-    without bounding them strictly to all-time highs/lows.
+    Robust Standardization: Normalizes continuous variables against macro regime shifts.
+    FIX: Added Softsign/Tanh squashing to strictly bound outputs to ~[-3.0, 3.0]
+    preventing Neural Network activation saturation during extreme macro volatility.
     """
     rolling_mean = series.rolling(window=window).mean()
     rolling_std = series.rolling(window=window).std()
-    return (series - rolling_mean) / (rolling_std + eps)
+    raw_z = (series - rolling_mean) / (rolling_std + eps)
+    
+    # Soft clip using Tanh to compress extreme outliers gracefully
+    return np.tanh(raw_z / 3.0) * 3.0
 
 def build_xau_features(df_raw: pd.DataFrame) -> pd.DataFrame:
     """
