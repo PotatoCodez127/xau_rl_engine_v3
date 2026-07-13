@@ -18,3 +18,4 @@ models/manager/saved
 tests/
 .env
 subscribers.json
+test_xau_diagnostics.py
