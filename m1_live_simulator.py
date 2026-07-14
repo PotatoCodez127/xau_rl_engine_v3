@@ -101,8 +101,7 @@ class StreamingFeatureEngine:
 
         df["h4_ema"] = df["xau_close"].ewm(span=800, adjust=False).mean()
         df["h4_trend"] = np.where(df["xau_close"] > df["h4_ema"], 1.0, -1.0)
-        
-        # --- NEW: Rolling Z-Scores ---
+
         close_frac_diff = np.log(df["xau_close"] / df["xau_close"].shift(1))
         df["close_frac_diff_norm"] = self._rolling_z_score(close_frac_diff)
         
@@ -117,9 +116,9 @@ class StreamingFeatureEngine:
         h1_vol_regime = df["env_atr"] / df["env_atr"].rolling(64).mean()
         df["h1_vol_regime_norm"] = self._rolling_z_score(h1_vol_regime)
 
-        df['ema_50'] = df['xau_close'].ewm(span=50, adjust=False).mean()
-        df['dist_ema_50'] = (df['xau_close'] - df['ema_50']) / df['xau_close']
-        df['dist_ema_50_norm'] = (df['dist_ema_50'] - df['dist_ema_50'].rolling(1000).mean()) / df['dist_ema_50'].rolling(1000).std()
+        df['ema_50'] = ta.ema(df['xau_close'], length=50)
+        dist_ema_50 = (df['xau_close'] - df['ema_50']) / df['xau_close']
+        df['dist_ema_50_norm'] = self._rolling_z_score(dist_ema_50)
 
         df['rolling_max_15m'] = df['xau_high'].rolling(14).max()
         df['rolling_min_15m'] = df['xau_low'].rolling(14).min()
@@ -222,15 +221,13 @@ class M1HighFidelitySimulator:
     def _load_onnx_models(self, oracle_onnx_path, manager_onnx_path):
         # 39 EXACT features aligned with the diagnostic output
         self.feature_cols = [
-            "xau_open", "xau_high", "xau_low", "xau_close", 
-            "h4_ema", "h4_trend", "close_frac_diff", "dxy_pct_change_15m", 
-            "mom_1", "mom_4", "mom_1_norm", "mom_4_norm", 
-            "h1_vol_regime", "ema_50", "dist_ema_50", "dist_ema_50_norm", 
-            "rolling_max_15m", "rolling_min_15m", "dist_rolling_max_15m_norm", "dist_rolling_min_15m_norm", 
-            "dist_res_zone_top_15m_norm", "dist_res_zone_bottom_15m_norm", "dist_sup_zone_top_15m_norm", "dist_sup_zone_bottom_15m_norm", 
-            "dist_res_zone_top_30m_norm", "dist_res_zone_bottom_30m_norm", "dist_sup_zone_top_30m_norm", "dist_sup_zone_bottom_30m_norm", 
-            "dist_res_zone_top_4h_norm", "dist_res_zone_bottom_4h_norm", "dist_sup_zone_top_4h_norm", "dist_sup_zone_bottom_4h_norm", 
-            "dist_daily_eq_norm", "dist_pivot_norm", "dist_R1_norm", "dist_S1_norm", 
+            "h4_trend", "rsi_14_norm", "close_frac_diff_norm", "dxy_pct_change_15m_norm",
+            "mom_1_norm", "mom_4_norm", "h1_vol_regime_norm", "dist_ema_50_norm",
+            "dist_rolling_max_15m_norm", "dist_rolling_min_15m_norm",
+            "dist_res_zone_top_15m_norm", "dist_res_zone_bottom_15m_norm", "dist_sup_zone_top_15m_norm", "dist_sup_zone_bottom_15m_norm",
+            "dist_res_zone_top_30m_norm", "dist_res_zone_bottom_30m_norm", "dist_sup_zone_top_30m_norm", "dist_sup_zone_bottom_30m_norm",
+            "dist_res_zone_top_4h_norm", "dist_res_zone_bottom_4h_norm", "dist_sup_zone_top_4h_norm", "dist_sup_zone_bottom_4h_norm",
+            "dist_daily_eq_norm", "dist_pivot_norm", "dist_R1_norm", "dist_S1_norm",
             "prob_long", "prob_short", "prob_hold"
         ]
 
@@ -427,12 +424,12 @@ class M1HighFidelitySimulator:
                     prob_hold, prob_long, prob_short = probs[0][0], probs[0][1], probs[0][2]
 
                     # 2. Re-inject real-time probabilities into the feature vector
-                    # Indices 36, 37, 38 align with the feature_cols map
-                    feature_vector[36] = prob_long
-                    feature_vector[37] = prob_short
-                    feature_vector[38] = prob_hold
+                    # Indices 26, 27, 28 align with the updated feature_cols map
+                    feature_vector[26] = prob_long
+                    feature_vector[27] = prob_short
+                    feature_vector[28] = prob_hold
 
-                    EXECUTION_THRESHOLD = 0.35
+                    EXECUTION_THRESHOLD = 0.4
                     current_h4_trend = latest_15m_features.get("h4_trend", 0)
                     env_atr = latest_15m_features.get("env_atr", 1.0)
                     direction = 0
@@ -447,13 +444,13 @@ class M1HighFidelitySimulator:
                             direction = 0  
 
                     if direction != 0:
-                        # 3. SAC Manager Prediction (42 Dimensions)
-                        obs = np.zeros(42, dtype=np.float32)
+                        # 3. SAC Manager Prediction (32 Dimensions)
+                        obs = np.zeros(32, dtype=np.float32)
                         
-                        obs[:39] = feature_vector
-                        obs[39] = float(np.clip(equity / self.initial_balance, 0.0, 10.0))
-                        obs[40] = float(np.clip((high_water_mark - equity) / high_water_mark, 0.0, 1.0))
-                        obs[41] = float(np.clip(bars_since_last_trade / 480.0, 0.0, 1.0))
+                        obs[:29] = feature_vector
+                        obs[29] = float(np.clip(equity / self.initial_balance, 0.0, 10.0))
+                        obs[30] = float(np.clip((high_water_mark - equity) / high_water_mark, 0.0, 1.0))
+                        obs[31] = float(np.clip(bars_since_last_trade / 480.0, 0.0, 1.0))
                         
                         obs_input = {self.manager_session.get_inputs()[0].name: obs[np.newaxis, ...]}
                         
