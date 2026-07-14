@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 from datetime import timezone
 import onnxruntime as ort
+import pandas_ta_classic as ta
 
 class DualM1DataFeed:
     """Mimics a live MT5 terminal receiving ticks from multiple symbols simultaneously."""
@@ -83,8 +84,15 @@ class StreamingFeatureEngine:
             return self._calculate_current_features()
         return None
 
+    def _rolling_z_score(self, series: pd.Series, window: int = 500, eps: float = 1e-8) -> pd.Series:
+        rolling_mean = series.rolling(window=window).mean()
+        rolling_std = series.rolling(window=window).std()
+        raw_z = (series - rolling_mean) / (rolling_std + eps)
+        return np.tanh(raw_z / 3.0) * 3.0
+
     def _calculate_current_features(self):
         df = self.m15_history.copy()
+        df['rsi_14_norm'] = ta.rsi(df['xau_close'], length=14) / 100.0
         
         high_low = df["xau_high"] - df["xau_low"]
         high_close = np.abs(df["xau_high"] - df["xau_close"].shift())
@@ -94,15 +102,20 @@ class StreamingFeatureEngine:
         df["h4_ema"] = df["xau_close"].ewm(span=800, adjust=False).mean()
         df["h4_trend"] = np.where(df["xau_close"] > df["h4_ema"], 1.0, -1.0)
         
-        df["close_frac_diff"] = np.log(df["xau_close"] / df["xau_close"].shift(1))
-        df["dxy_pct_change_15m"] = df["dxy_close"].pct_change()
+        # --- NEW: Rolling Z-Scores ---
+        close_frac_diff = np.log(df["xau_close"] / df["xau_close"].shift(1))
+        df["close_frac_diff_norm"] = self._rolling_z_score(close_frac_diff)
+        
+        dxy_pct = df["dxy_close"].pct_change()
+        df["dxy_pct_change_15m_norm"] = self._rolling_z_score(dxy_pct)
         
         df['mom_1'] = df['xau_close'].diff(1)
         df['mom_4'] = df['xau_close'].diff(4)
-        df['mom_1_norm'] = (df['mom_1'] - df['mom_1'].rolling(1000).mean()) / df['mom_1'].rolling(1000).std()
-        df['mom_4_norm'] = (df['mom_4'] - df['mom_4'].rolling(1000).mean()) / df['mom_4'].rolling(1000).std()
+        df['mom_1_norm'] = self._rolling_z_score(df['mom_1'])
+        df['mom_4_norm'] = self._rolling_z_score(df['mom_4'])
 
-        df["h1_vol_regime"] = df["env_atr"] / df["env_atr"].rolling(64).mean()
+        h1_vol_regime = df["env_atr"] / df["env_atr"].rolling(64).mean()
+        df["h1_vol_regime_norm"] = self._rolling_z_score(h1_vol_regime)
 
         df['ema_50'] = df['xau_close'].ewm(span=50, adjust=False).mean()
         df['dist_ema_50'] = (df['xau_close'] - df['ema_50']) / df['xau_close']

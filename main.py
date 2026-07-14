@@ -147,12 +147,14 @@ feature_engine = StreamingFeatureEngine(window_size=1000)
 feature_buffer = deque(maxlen=30)
 
 feature_cols = [
-    "h4_trend", "h1_vol_regime", "close_frac_diff", "mom_1_norm", "mom_4_norm", "dxy_pct_change_15m",
-    "dist_ema_50_norm", "dist_rolling_max_15m_norm", "dist_rolling_min_15m_norm",
+    "h4_trend", "rsi_14_norm", "close_frac_diff_norm", "dxy_pct_change_15m_norm",
+    "mom_1_norm", "mom_4_norm", "h1_vol_regime_norm", "dist_ema_50_norm",
+    "dist_rolling_max_15m_norm", "dist_rolling_min_15m_norm",
     "dist_res_zone_top_15m_norm", "dist_res_zone_bottom_15m_norm", "dist_sup_zone_top_15m_norm", "dist_sup_zone_bottom_15m_norm",
     "dist_res_zone_top_30m_norm", "dist_res_zone_bottom_30m_norm", "dist_sup_zone_top_30m_norm", "dist_sup_zone_bottom_30m_norm",
     "dist_res_zone_top_4h_norm", "dist_res_zone_bottom_4h_norm", "dist_sup_zone_top_4h_norm", "dist_sup_zone_bottom_4h_norm",
-    "dist_daily_eq_norm", "dist_pivot_norm", "dist_R1_norm", "dist_S1_norm"
+    "dist_daily_eq_norm", "dist_pivot_norm", "dist_R1_norm", "dist_S1_norm",
+    "prob_long", "prob_short", "prob_hold"
 ]
 
 oracle_session = None
@@ -199,12 +201,17 @@ async def live_trading_loop():
 
                     if len(feature_buffer) == 30:
                         # --- PHASE A: CONTINUOUS ORACLE INFERENCE ---
-                        buffer_array = np.array(feature_buffer, dtype=np.float32).reshape(1, 30, -1)
+                        buffer_array = np.array(feature_buffer, dtype=np.float32).reshape(1, 30, 29)
                         logits = await asyncio.to_thread(
                             oracle_session.run, None, {oracle_input_name: buffer_array}
                         )
                         probs = numpy_softmax(logits[0])[0]
                         prob_hold, prob_long, prob_short = probs[0], probs[1], probs[2]
+
+                        # Re-inject live probabilities back into the feature vector for the Manager
+                        feature_vector[26] = prob_long
+                        feature_vector[27] = prob_short
+                        feature_vector[28] = prob_hold
 
                         # Ensure MT5 Live Balance Parity with XAUDynamicEnv
                         account = await asyncio.to_thread(mt5.account_info)
@@ -215,12 +222,11 @@ async def live_trading_loop():
                             current_bal = state.data["balance"]
 
                         # --- PHASE B: CONTINUOUS MANAGER INFERENCE (Uncapped) ---
-                        obs = np.zeros(31, dtype=np.float32)
-                        obs[:25] = feature_vector
-                        obs[25], obs[26], obs[27] = prob_hold, prob_long, prob_short
-                        obs[28] = float(np.clip(current_bal / 10000.0, 0.0, 10.0))
-                        obs[29] = float(np.clip((state.data["peak_balance"] - current_bal) / state.data["peak_balance"], 0.0, 1.0))
-                        obs[30] = float(np.clip(state.data["bars_since_last_trade"] / 480.0, 0.0, 1.0))
+                        obs = np.zeros(32, dtype=np.float32) # Increased to 32 dimensions
+                        obs[:29] = feature_vector
+                        obs[29] = float(np.clip(current_bal / 10000.0, 0.0, 10.0))
+                        obs[30] = float(np.clip((state.data["peak_balance"] - current_bal) / state.data["peak_balance"], 0.0, 1.0))
+                        obs[31] = float(np.clip(state.data["bars_since_last_trade"] / 480.0, 0.0, 1.0))
                         
                         onnx_obs = obs.reshape(1, -1)
                         action = await asyncio.to_thread(
