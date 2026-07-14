@@ -3,10 +3,12 @@ import pandas as pd
 import numpy as np
 import onnxruntime as ort
 from env.xau_dynamic_env import XAUDynamicEnv
-import numpy as np
-np.random.seed(42) # Locks the stochastic trade resolution
+
 # Silence benign ONNX batch-size shape warnings
 ort.set_default_logger_severity(3)
+
+# Lock RNG to ensure deterministic validation as per recent updates
+np.random.seed(42)
 
 def numpy_softmax(x):
     e_x = np.exp(x - np.max(x, axis=-1, keepdims=True))
@@ -16,6 +18,7 @@ def run_deep_diagnostics():
     """
     Executes a high-fidelity WFA fold validation run on Local CPU.
     Utilizes ONNX Runtime for massive inference speedups.
+    Now includes Dual-Tier OOS Logging.
     """
     # Standard Local Windows Paths
     DATA_PATH = os.path.join("data", "processed_features.parquet")
@@ -32,7 +35,6 @@ def run_deep_diagnostics():
     df = pd.read_parquet(DATA_PATH)
     val_idx = int(len(df) * 0.8)
     
-    # FIXED: Removed drop=True so 'datetime' index becomes a column for the Env to use
     df_val = df.iloc[val_idx:].copy().reset_index()
 
     # 2. Inject ONNX Oracle Probabilities
@@ -66,7 +68,7 @@ def run_deep_diagnostics():
     manager_session = ort.InferenceSession(MANAGER_ONNX, providers=['CPUExecutionProvider'])
     manager_input_name = manager_session.get_inputs()[0].name
 
-    # 4. Simulation Loop
+    # 4. Simulation Loop & Logging Setup
     obs, _ = env.reset()
     terminated, truncated = False, False
     
@@ -74,23 +76,61 @@ def run_deep_diagnostics():
     wins = 0
     peak = 10000.0
     
-    print("📈 Running Fast-Forward ONNX Simulation...")
+    # Dual-Tier Logging Arrays
+    trade_journal = []
+    neural_log = []
+    
+    print("📈 Running Fast-Forward ONNX Simulation & Data Extraction...")
     while not (terminated or truncated):
+        current_step_idx = env.current_step
+        current_dt = df_val["datetime"].iloc[current_step_idx] if current_step_idx < len(df_val) else "Terminal"
+        balance_before = env.balance
+
         # Shape the observation for the ONNX C++ engine (1, 32)
         onnx_obs = obs.astype(np.float32).reshape(1, -1)
         action = manager_session.run(None, {manager_input_name: onnx_obs})[0][0]
         
         obs, reward, terminated, truncated, info = env.step(action)
         
+        # Log Neural Heartbeat (Every Step)
+        neural_log.append({
+            "datetime": current_dt,
+            "prob_hold": df_val["prob_hold"].iloc[current_step_idx] if current_step_idx < len(df_val) else 0.0,
+            "prob_long": info.get("prob_long", 0.0),
+            "prob_short": info.get("prob_short", 0.0),
+            "sl_mult_intent": info.get("sl_mult_used", 0.0),
+            "tp_mult_intent": info.get("tp_mult_used", 0.0),
+            "imbalance_ratio": info.get("imbalance_ratio", 0.0),
+            "step_reward": reward
+        })
+        
+        # Log Trade Journal (Only on execution)
         if env.bars_since_last_trade == 0:  
             trades += 1
-            # Check if balance went up or down compared to previous step
-            if reward > 0: 
+            simulated_pnl = env.balance - balance_before
+            
+            trade_journal.append({
+                "datetime": current_dt,
+                "prob_long": info.get("prob_long", 0.0),
+                "prob_short": info.get("prob_short", 0.0),
+                "sl_mult_used": info.get("sl_mult_used", 0.0),
+                "tp_mult_used": info.get("tp_mult_used", 0.0),
+                "simulated_pnl": simulated_pnl,
+                "account_balance": env.balance
+            })
+
+            # Check if balance went up compared to previous step
+            if simulated_pnl > 0: 
                 wins += 1
                 
         peak = max(peak, env.balance)
 
-    # 5. Output Diagnostics
+    # 5. Export Logs
+    pd.DataFrame(trade_journal).to_csv("logs/high_fidelity_journal.csv", index=False)
+    pd.DataFrame(neural_log).to_csv("logs/neural_research_log.csv", index=False)
+    print("💾 Saved high_fidelity_journal.csv and neural_research_log.csv")
+
+    # 6. Output Diagnostics
     drawdown = ((peak - env.balance) / peak) * 100 if peak > 0 else 0.0
     win_rate = (wins / trades * 100) if trades > 0 else 0
     roi = ((env.balance - 10000.0) / 10000.0) * 100
