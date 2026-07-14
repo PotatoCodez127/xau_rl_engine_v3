@@ -4,7 +4,7 @@ import numpy as np
 import onnxruntime as ort
 from env.xau_dynamic_env import XAUDynamicEnv
 import numpy as np
-np.random.seed(42)
+np.random.seed(42) # Locks the stochastic trade resolution
 # Silence benign ONNX batch-size shape warnings
 ort.set_default_logger_severity(3)
 
