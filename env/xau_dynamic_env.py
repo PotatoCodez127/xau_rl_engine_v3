@@ -5,24 +5,98 @@ from gymnasium import spaces
 from collections import deque
 
 class XAUDynamicEnv(gym.Env):
+    """
+    XAUUSD Master-Slave Execution Environment (V3.2).
+    Phase A (Oracle) strictly dictates direction. Phase B (SAC Manager) exclusively dictates sizing.
+    Refactored: Dynamic MFE Exits, Symmetry Forcing, and Risk-Adjusted Reward Shaping.
+    """
     def __init__(self, df: pd.DataFrame, initial_balance=10000.0):
-        # ... [Keep existing init code] ...
+        super(XAUDynamicEnv, self).__init__()
         
-        # Symmetry Forcing: Track last 20 trade directions
+        self.df = df.reset_index(drop=True) 
+        self.initial_balance = initial_balance
+        self.friction_cost = 10.0
+
+        self.min_bars_between_trades = 4 
+        self.max_trades_per_day = 1       
+        
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
+
+        exclude_cols = ["target", "time", "datetime", "date", "index"]
+        self.feature_cols = [
+            c for c in self.df.columns if c not in exclude_cols and not c.startswith("env_")
+        ]
+
+        self.observation_space = spaces.Box(
+            low=-10.0, high=10.0, shape=(len(self.feature_cols) + 3,), dtype=np.float32
+        )
+
+        # AOT Memory Allocation
+        self.features_mat = np.ascontiguousarray(self.df[self.feature_cols].values, dtype=np.float32)
+        self.dates_arr = pd.to_datetime(self.df["datetime"]).dt.date.values
+        self.prob_long_arr = np.ascontiguousarray(self.df["prob_long"].values, dtype=np.float32)
+        self.prob_short_arr = np.ascontiguousarray(self.df["prob_short"].values, dtype=np.float32)
+        self.prob_hold_arr = np.ascontiguousarray(self.df["prob_hold"].values, dtype=np.float32)
+        self.h4_trend_arr = np.ascontiguousarray(self.df["h4_trend"].values, dtype=np.float32)
+        
+        self.max_steps = len(self.features_mat) - 1
+
+        # State Variables
+        self.current_step = 30
+        self.balance = self.initial_balance
+        self.peak_balance = self.initial_balance
+        self.bars_since_last_trade = 0
+        self.trades_today = 0
+        self.current_day = self.dates_arr[self.current_step]
+        
+        # --- NEW: Symmetry Forcing History ---
         self.trade_history = deque(maxlen=20)
         self.long_count = 0
         self.short_count = 0
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        # ... [Keep existing reset variables] ...
+        self.current_step = 30
+        self.balance = self.initial_balance
+        self.peak_balance = self.initial_balance
+        self.bars_since_last_trade = 0
+        self.trades_today = 0
+        self.current_day = self.dates_arr[self.current_step]
+        
+        # Reset symmetry tracking
         self.trade_history.clear()
         self.long_count = 0
         self.short_count = 0
+        
         return self._get_obs(), {}
+
+    def _get_obs(self):
+        obs = np.zeros(self.observation_space.shape[0], dtype=np.float32)
+        X = self.features_mat[self.current_step]
+        obs[: len(X)] = X
+
+        obs[-3] = float(np.clip(self.balance / self.initial_balance, 0.0, 10.0))
+        obs[-2] = float(np.clip((self.peak_balance - self.balance) / self.peak_balance, 0.0, 1.0))
+        obs[-1] = float(np.clip(self.bars_since_last_trade / 480.0, 0.0, 1.0))
+        
+        return np.clip(obs, -10.0, 10.0)
+
+    def _scale_action(self, action: np.ndarray) -> tuple[float, float]:
+        sl_mult = 0.5 + ((action[0] + 1.0) * (2.0 - 0.5)) / 2.0
+        tp_mult = 1.0 + ((action[1] + 1.0) * (3.0 - 1.0)) / 2.0
+        return sl_mult, tp_mult
+
+    def _evaluate_master_slave_trigger(self, prob_long: float, prob_short: float, prob_hold: float, h4_trend: float) -> int:
+        EXECUTION_THRESHOLD = 0.45
+        if prob_long > EXECUTION_THRESHOLD and prob_long > prob_hold and h4_trend > 0:
+            return 1
+        elif prob_short > EXECUTION_THRESHOLD and prob_short > prob_hold and h4_trend < 0:
+            return 2
+        return 0
 
     def step(self, action):
         step_date = self.dates_arr[self.current_step]
+        
         if step_date > self.current_day:
             self.current_day = step_date
             self.trades_today = 0
@@ -56,24 +130,18 @@ class XAUDynamicEnv(gym.Env):
             imbalance_ratio = max(self.long_count, self.short_count) / max(1, len(self.trade_history))
             symmetry_penalty = 0.0
             if len(self.trade_history) >= 10 and imbalance_ratio > 0.8:
-                # Penalize heavy unidirectional bias
                 symmetry_penalty = (imbalance_ratio - 0.8) * 5.0 
             
             amount_at_risk = self.balance * 0.015
             prob_win = prob_long if direction == 1 else prob_short
 
-            # --- DYNAMIC EXITS & EXCURSION PROXY ---
-            # Instead of a binary win/loss, we model MFE/MAE probability based on action sizing
+            # --- DYNAMIC EXITS ---
             is_win = np.random.rand() < prob_win
             
             if is_win:
-                # MFE Protection: Larger TP targets have higher probability of reversing before fill.
-                # We dynamically haircut the profit based on how greedy the TP multiplier is.
                 mfe_haircut = np.clip(1.0 - (tp_mult_used * 0.05), 0.5, 1.0)
                 simulated_pnl = (amount_at_risk * (tp_mult_used / sl_mult_used)) * mfe_haircut
             else:
-                # MAE Cutting: Tighter stop losses cut the trade earlier, saving capital.
-                # A wide SL multiplier results in full loss.
                 simulated_pnl = -amount_at_risk * np.clip(sl_mult_used, 0.5, 1.0)
 
             simulated_pnl -= self.friction_cost
@@ -83,15 +151,13 @@ class XAUDynamicEnv(gym.Env):
             # --- RISK-ADJUSTED REWARD RESHAPING ---
             drawdown = (self.peak_balance - self.balance) / self.peak_balance
             
-            # Sortino/Risk Proxy: Penalize the sizing directly. 
-            # High action variance (sl_mult_used near 2.0) incurs a stability tax.
-            sizing_risk_penalty = ((sl_mult_used - 0.5) / 1.5) * (self.initial_balance * 0.005)
-            drawdown_penalty = drawdown * self.initial_balance * 0.5 # Increased DB penalty
+            # Sortino Proxy: Penalize high action variance
+            sizing_risk_penalty = ((sl_mult_used - 0.5) / 1.5) * (self.initial_balance * 0.015)
+            drawdown_penalty = drawdown * self.initial_balance * 0.5 
             
             raw_reward = simulated_pnl - drawdown_penalty - sizing_risk_penalty
-            
-            # Normalize and apply symmetry penalty
             normalized_reward = float(np.clip((raw_reward / (self.initial_balance * 0.01)), -10.0, 10.0))
+            
             reward = normalized_reward - symmetry_penalty
 
         self.current_step += 1
