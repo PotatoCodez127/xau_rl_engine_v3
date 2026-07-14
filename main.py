@@ -94,11 +94,12 @@ state = LiveEnvState(STATE_FILE)
 # 2. MT5 ASYNC FEED
 # ==============================================================
 class LiveMT5Feed:
-    def __init__(self, xau_symbol="XAUUSD", dxy_symbol="USDIndex"):
+    def __init__(self, xau_symbol="XAUUSDr", dxy_symbol="USDIndex"):
         if not mt5.initialize():
             logger.error(f"[MT5] Init failed: {mt5.last_error()}")
         self.xau = xau_symbol
         self.dxy = dxy_symbol
+        logger.info(f"[MT5] Connected. Streaming {self.xau} & {self.dxy}")
 
     def get_latest_tick(self):
         tick_xau = mt5.symbol_info_tick(self.xau)
@@ -120,6 +121,14 @@ class LiveMT5Feed:
     def fetch_historical_warmup(self, bars=16000):
         rates_xau = mt5.copy_rates_from_pos(self.xau, mt5.TIMEFRAME_M1, 0, bars)
         rates_dxy = mt5.copy_rates_from_pos(self.dxy, mt5.TIMEFRAME_M1, 0, bars)
+        
+        # 2. Add validation block to capture connection/symbol issues cleanly
+        if rates_xau is None or rates_dxy is None:
+            raise ValueError(
+                f"Failed to fetch historical rates. Ensure MT5 terminal is running, "
+                f"logged into your broker, and that symbols '{self.xau}' and '{self.dxy}' "
+                f"are visible in your Market Watch window."
+            )
         
         df_xau = pd.DataFrame(rates_xau)
         df_xau['datetime'] = pd.to_datetime(df_xau['time'], unit='s').dt.tz_localize('UTC')
