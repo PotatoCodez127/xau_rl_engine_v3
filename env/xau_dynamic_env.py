@@ -87,7 +87,7 @@ class XAUDynamicEnv(gym.Env):
         return sl_mult, tp_mult
 
     def _evaluate_master_slave_trigger(self, prob_long: float, prob_short: float, prob_hold: float, h4_trend: float) -> int:
-        EXECUTION_THRESHOLD = 0.45
+        EXECUTION_THRESHOLD = 0.40
         if prob_long > EXECUTION_THRESHOLD and prob_long > prob_hold and h4_trend > 0:
             return 1
         elif prob_short > EXECUTION_THRESHOLD and prob_short > prob_hold and h4_trend < 0:
