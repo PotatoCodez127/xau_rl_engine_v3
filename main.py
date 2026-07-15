@@ -1,6 +1,6 @@
 import os
 import json
-import time
+import csv
 import asyncio
 import logging
 import sys
@@ -51,6 +51,15 @@ def numpy_softmax(x):
     e_x = np.exp(x - np.max(x, axis=-1, keepdims=True))
     return e_x / e_x.sum(axis=-1, keepdims=True)
 
+# Optimized CSV Logger (Removes Pandas Overhead)
+def append_csv_log(filepath, data_dict):
+    file_exists = os.path.isfile(filepath)
+    with open(filepath, 'a', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=data_dict.keys())
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(data_dict)
+
 # ==============================================================
 # 1. LIVE ENVIRONMENT STATE (Autonomous Parity)
 # ==============================================================
@@ -73,7 +82,7 @@ class LiveEnvState:
                 "balance": 10000.0,
                 "peak_balance": 10000.0,
                 "trade_history": [],
-                "active_trade": None  # <-- Autonomous Sequential Tracker
+                "active_trade": None
             }
 
     def save(self):
@@ -107,6 +116,7 @@ class LiveMT5Feed:
         tick_dxy = mt5.symbol_info_tick(self.dxy)
         
         if tick_xau is None or tick_dxy is None:
+            logger.warning("[MT5] Tick fetch failed. Attempting re-initialization...")
             mt5.initialize()
             return None, None
 
@@ -127,7 +137,7 @@ class LiveMT5Feed:
             raise ValueError(
                 f"Failed to fetch historical rates. Ensure MT5 terminal is running, "
                 f"logged into your broker, and that symbols '{self.xau}' and '{self.dxy}' "
-                f"are visible in your Market Watch window."
+                f"are visible."
             )
         
         df_xau = pd.DataFrame(rates_xau)
@@ -146,7 +156,6 @@ feed = LiveMT5Feed()
 feature_engine = StreamingFeatureEngine(window_size=1000)
 feature_buffer = deque(maxlen=30)
 
-# Aligned with your WFA training data
 feature_cols = [
     "h4_trend", "rsi_14_norm", "close_frac_diff_norm", "dxy_pct_change_15m_norm",
     "mom_1_norm", "mom_4_norm", "h1_vol_regime_norm", "dist_ema_50_norm",
@@ -158,19 +167,81 @@ feature_cols = [
     "prob_long", "prob_short", "prob_hold"
 ]
 
+# Dynamic indices to prevent "Magic Number" errors
+PROB_LONG_IDX = feature_cols.index("prob_long")
+PROB_SHORT_IDX = feature_cols.index("prob_short")
+PROB_HOLD_IDX = feature_cols.index("prob_hold")
+
 oracle_session = None
 manager_session = None
 
 # ==============================================================
-# 3. CORE ASYNC ENGINE LOOP
+# 3. CORE LOGIC EXTRACTS
 # ==============================================================
-def append_csv_log(filepath, data_dict):
-    df = pd.DataFrame([data_dict])
-    if not os.path.isfile(filepath):
-        df.to_csv(filepath, index=False)
-    else:
-        df.to_csv(filepath, mode='a', header=False, index=False)
+async def resolve_active_trade(tick_row, timestamp):
+    """Handles the autonomous tracking and resolution of an active trade."""
+    active_trade = state.data.get("active_trade")
+    if not active_trade:
+        return
 
+    resolved = False
+    outcome = None
+    pnl = 0.0
+    
+    high_price = tick_row["xau_high"]
+    low_price = tick_row["xau_low"]
+    
+    trade_type = active_trade["type"]
+    sl = active_trade["sl"]
+    tp = active_trade["tp"]
+    sl_mult = active_trade["sl_mult_used"]
+    tp_mult = active_trade["tp_mult_used"]
+    amount_at_risk = active_trade["amount_at_risk"]
+
+    if trade_type == "Long":
+        if low_price <= sl:
+            resolved, outcome = True, "loss"
+        elif high_price >= tp:
+            resolved, outcome = True, "win"
+    elif trade_type == "Short":
+        if high_price >= sl:
+            resolved, outcome = True, "loss"
+        elif low_price <= tp:
+            resolved, outcome = True, "win"
+
+    if resolved:
+        if outcome == "win":
+            mfe_haircut = np.clip(1.0 - (tp_mult * 0.05), 0.5, 1.0)
+            pnl = (amount_at_risk * (tp_mult / sl_mult)) * mfe_haircut
+        else:
+            pnl = -amount_at_risk * np.clip(sl_mult, 0.5, 1.0)
+
+        pnl -= 10.0  # Slippage/Comms
+        
+        new_balance = state.data["balance"] + pnl
+        state.data["balance"] = round(new_balance, 2)
+        state.data["peak_balance"] = round(max(state.data["peak_balance"], new_balance), 2)
+        state.data["active_trade"] = None
+        
+        # Offload file save to thread
+        await asyncio.to_thread(state.save)
+
+        logger.info(f"🔔 POSITION CLOSED [{outcome.upper()}] | PnL: ${pnl:+.2f} | New Balance: ${state.data['balance']:.2f}")
+
+        journal_entry = {
+            "datetime": str(timestamp),
+            "prob_long": active_trade["prob_long"],
+            "prob_short": active_trade["prob_short"],
+            "sl_mult_used": sl_mult,
+            "tp_mult_used": tp_mult,
+            "simulated_pnl": round(pnl, 2),
+            "account_balance": round(new_balance, 2)
+        }
+        await asyncio.to_thread(append_csv_log, JOURNAL_PATH, journal_entry)
+
+# ==============================================================
+# 4. CORE ASYNC ENGINE LOOP
+# ==============================================================
 async def live_trading_loop():
     logger.info("🚀 Initiating Deep Diagnostics Parity Live Loop...")
 
@@ -193,6 +264,11 @@ async def live_trading_loop():
             
             if timestamp and tick_row:
                 state.update_daily_limits(timestamp)
+                
+                # 1. Resolve active trades first on raw tick extremes
+                await resolve_active_trade(tick_row, timestamp)
+                
+                # 2. Process features
                 latest_features = feature_engine.process_m1_tick(timestamp, tick_row)
                 
                 if latest_features is not None:
@@ -209,89 +285,15 @@ async def live_trading_loop():
                         probs = numpy_softmax(logits[0])[0]
                         prob_hold, prob_long, prob_short = probs[0], probs[1], probs[2]
 
-                        # Re-inject live probabilities back into the feature vector for the Manager
-                        feature_vector[26] = prob_long
-                        feature_vector[27] = prob_short
-                        feature_vector[28] = prob_hold
+                        # Dynamic Indexing Replacement
+                        feature_vector[PROB_LONG_IDX] = prob_long
+                        feature_vector[PROB_SHORT_IDX] = prob_short
+                        feature_vector[PROB_HOLD_IDX] = prob_hold
 
-                        # --- PURE INTERNAL BALANCE TRACKING ---
                         current_bal = state.data["balance"]
                         state.data["peak_balance"] = max(state.data["peak_balance"], current_bal)
-                        active_trade = state.data.get("active_trade")
 
-                        # ==============================================================
-                        # A. ACTIVE TRADE RESOLVER (AUTONOMOUS TICK PARSING)
-                        # ==============================================================
-                        if active_trade is not None:
-                            resolved = False
-                            outcome = None
-                            pnl = 0.0
-                            
-                            high_price = tick_row["xau_high"]
-                            low_price = tick_row["xau_low"]
-                            
-                            trade_type = active_trade["type"]
-                            sl = active_trade["sl"]
-                            tp = active_trade["tp"]
-                            sl_mult = active_trade["sl_mult_used"]
-                            tp_mult = active_trade["tp_mult_used"]
-                            amount_at_risk = active_trade["amount_at_risk"]
-
-                            # Check triggers based on direction using M1 extremes
-                            if trade_type == "Long":
-                                if low_price <= sl:
-                                    resolved = True
-                                    outcome = "loss"
-                                elif high_price >= tp:
-                                    resolved = True
-                                    outcome = "win"
-                            elif trade_type == "Short":
-                                if high_price >= sl:
-                                    resolved = True
-                                    outcome = "loss"
-                                elif low_price <= tp:
-                                    resolved = True
-                                    outcome = "win"
-
-                            if resolved:
-                                # Strict RL Training Parity math (env/xau_dynamic_env.py)
-                                if outcome == "win":
-                                    mfe_haircut = np.clip(1.0 - (tp_mult * 0.05), 0.5, 1.0)
-                                    pnl = (amount_at_risk * (tp_mult / sl_mult)) * mfe_haircut
-                                else:
-                                    pnl = -amount_at_risk * np.clip(sl_mult, 0.5, 1.0)
-
-                                pnl -= 10.0  # Apply $10 friction cost (Slippage/Comms)
-                                
-                                # Update Internal Finaces & State
-                                new_balance = current_bal + pnl
-                                state.data["balance"] = round(new_balance, 2)
-                                state.data["peak_balance"] = round(max(state.data["peak_balance"], new_balance), 2)
-                                state.data["active_trade"] = None
-                                state.save()
-
-                                logger.info(f"🔔 POSITION CLOSED [{outcome.upper()}] | PnL: ${pnl:+.2f} | New Balance: ${state.data['balance']:.2f}")
-
-                                # Post-Resolution Logging: Commit Trade Journal
-                                append_csv_log(JOURNAL_PATH, {
-                                    "datetime": str(timestamp),
-                                    "prob_long": active_trade["prob_long"],
-                                    "prob_short": active_trade["prob_short"],
-                                    "sl_mult_used": sl_mult,
-                                    "tp_mult_used": tp_mult,
-                                    "simulated_pnl": round(pnl, 2),
-                                    "account_balance": round(new_balance, 2)
-                                })
-                                
-                                # Reset variables for inference pipeline
-                                current_bal = state.data["balance"]
-                                active_trade = None
-
-
-                        # ==============================================================
-                        # B. STRATEGY INFERENCE & LOGGING
-                        # ==============================================================
-                        # --- PHASE B: CONTINUOUS MANAGER INFERENCE (Uncapped) ---
+                        # --- PHASE B: CONTINUOUS MANAGER INFERENCE ---
                         obs = np.zeros(32, dtype=np.float32)
                         obs[:29] = feature_vector
                         obs[29] = float(np.clip(current_bal / 10000.0, 0.0, 10.0))
@@ -304,18 +306,18 @@ async def live_trading_loop():
                         )
                         raw_sl, raw_tp = action[0][0]
 
-                        # Action Scaling (Symmetry with XAUDynamicEnv)
+                        # Action Scaling
                         sl_mult_used = 0.5 + ((raw_sl + 1.0) * (2.0 - 0.5)) / 2.0
                         tp_mult_ratio = 1.0 + ((raw_tp + 1.0) * (3.0 - 1.0)) / 2.0
                         tp_mult_used = sl_mult_used * tp_mult_ratio 
 
-                        # Calculate Imbalance Ratio for Logging
+                        # Imbalance Ratio
                         long_count = sum(1 for d in state.trade_history if d == 1)
                         short_count = sum(1 for d in state.trade_history if d == 2)
                         imbalance_ratio = max(long_count, short_count) / max(1, len(state.trade_history))
 
-                        # Dual-Tier Logging: Neural Heartbeat
-                        append_csv_log(NEURAL_LOG_PATH, {
+                        # Log offloaded to async thread
+                        neural_entry = {
                             "datetime": str(timestamp),
                             "prob_hold": prob_hold,
                             "prob_long": prob_long,
@@ -324,25 +326,21 @@ async def live_trading_loop():
                             "tp_mult_intent": tp_mult_used,
                             "imbalance_ratio": imbalance_ratio,
                             "step_reward": 0.0 
-                        })
+                        }
+                        await asyncio.to_thread(append_csv_log, NEURAL_LOG_PATH, neural_entry)
 
                         # --- CONSOLE HEARTBEAT LOGGER ---
                         current_h4_trend = latest_features.get("h4_trend", 0.0)
                         MAX_TRADES_PER_DAY = 5
                         
-                        # Determine current execution blockers
                         cooldown_blocked = state.data["bars_since_last_trade"] < 4
                         limit_blocked = state.data["trades_today"] >= MAX_TRADES_PER_DAY
-                        active_blocked = active_trade is not None
+                        active_blocked = state.data.get("active_trade") is not None
                         
-                        if active_blocked:
-                            status_flag = "⚠️ IN TRADE"
-                        elif cooldown_blocked:
-                            status_flag = "⏸️ COOLDOWN" 
-                        elif limit_blocked:
-                            status_flag = "🚫 LIMIT HIT"
-                        else:
-                            status_flag = "🟢 READY"
+                        if active_blocked: status_flag = "⚠️ IN TRADE"
+                        elif cooldown_blocked: status_flag = "⏸️ COOLDOWN" 
+                        elif limit_blocked: status_flag = "🚫 LIMIT HIT"
+                        else: status_flag = "🟢 READY"
 
                         trend_direction = "UP" if current_h4_trend > 0 else "DOWN"
 
@@ -358,7 +356,6 @@ async def live_trading_loop():
                         # ==============================================================
                         # C. TRIGGER EVALUATION & EXECUTION DISPATCH
                         # ==============================================================
-                        # --- MASTER SLAVE TRIGGER ---
                         EXECUTION_THRESHOLD = 0.40
                         env_atr = latest_features.get("env_atr", 1.0)
 
@@ -368,10 +365,8 @@ async def live_trading_loop():
                         elif prob_short > EXECUTION_THRESHOLD and prob_short > prob_hold and current_h4_trend < 0:
                             direction = 2
 
-                        # Sequential Execution Veto
-                        if direction != 0:
-                            if cooldown_blocked or limit_blocked or active_blocked:
-                                direction = 0
+                        if direction != 0 and (cooldown_blocked or limit_blocked or active_blocked):
+                            direction = 0
 
                         # Dispatch Sequence
                         if direction != 0:
@@ -383,12 +378,10 @@ async def live_trading_loop():
                             sl_price = entry_price - sl_distance if direction == 1 else entry_price + sl_distance
                             tp_price = entry_price + tp_distance if direction == 1 else entry_price - tp_distance
 
-                            # Strict Dynamic Sizing (Model Intent)
                             base_risk = current_bal * 0.015
                             intended_risk_amount = (base_risk * max(0.5, min(1.0, sl_mult_used))) + 10.0
                             
-                            calculated_lot_size = round(intended_risk_amount / (sl_distance * 100), 2)
-                            calculated_lot_size = max(0.01, calculated_lot_size) # MT5 Minimum
+                            calculated_lot_size = max(0.01, round(intended_risk_amount / (sl_distance * 100), 2))
                             
                             signal_data = {
                                 "type": "Long" if direction == 1 else "Short",
@@ -402,12 +395,11 @@ async def live_trading_loop():
                             logger.info(f"[{timestamp}] 🚀 VALID SIGNAL. Dispatching via WA...")
                             await asyncio.to_thread(wa_manager.broadcast_signal, signal_data)
                             
-                            # Lock down the Sequential Tracker
                             state.data["active_trade"] = {
                                 "type": "Long" if direction == 1 else "Short",
-                                "entry": entry_price,
-                                "sl": sl_price,
-                                "tp": tp_price,
+                                "entry": float(entry_price),
+                                "sl": float(sl_price),
+                                "tp": float(tp_price),
                                 "sl_mult_used": float(sl_mult_used),
                                 "tp_mult_used": float(tp_mult_used),
                                 "amount_at_risk": float(base_risk),
@@ -415,11 +407,10 @@ async def live_trading_loop():
                                 "prob_short": float(prob_short)
                             }
 
-                            # Update Environmental State
                             state.trade_history.append(direction)
                             state.data["bars_since_last_trade"] = 0
                             state.data["trades_today"] += 1
-                            state.save()
+                            await asyncio.to_thread(state.save)
 
         except Exception as e:
             logger.error(f"Live Loop Exception: {e}", exc_info=True)
@@ -435,7 +426,7 @@ async def reminder_loop():
         await asyncio.sleep(300)
 
 # ==============================================================
-# 4. FASTAPI LIFESPAN & ROUTING
+# 5. FASTAPI LIFESPAN & ROUTING
 # ==============================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -454,6 +445,8 @@ async def lifespan(app: FastAPI):
     trading_task.cancel()
     reminder_task.cancel()
     mt5.shutdown()
+    
+    # Final sync save on shutdown
     state.save()
 
 app = FastAPI(title="XAU Quant Copilot - Live Engine", lifespan=lifespan)
