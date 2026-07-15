@@ -214,13 +214,9 @@ async def live_trading_loop():
                         feature_vector[27] = prob_short
                         feature_vector[28] = prob_hold
 
-                        # Ensure MT5 Live Balance Parity with XAUDynamicEnv
-                        account = await asyncio.to_thread(mt5.account_info)
-                        if account:
-                            current_bal = account.balance
-                            state.data["peak_balance"] = max(state.data["peak_balance"], current_bal)
-                        else:
-                            current_bal = state.data["balance"]
+                        # Pure Internal Balance Tracking (No MT5 Sync)
+                        current_bal = state.data["balance"]
+                        state.data["peak_balance"] = max(state.data["peak_balance"], current_bal)
 
                         # --- PHASE B: CONTINUOUS MANAGER INFERENCE (Uncapped) ---
                         obs = np.zeros(32, dtype=np.float32) # Increased to 32 dimensions
@@ -294,12 +290,31 @@ async def live_trading_loop():
                         if direction != 0:
                             entry_price = tick_row["xau_close"]
                             
+                            # 1. Calculate Prices
+                            sl_distance = env_atr * sl_mult_used
+                            tp_distance = env_atr * tp_mult_used
+                            
+                            sl_price = entry_price - sl_distance if direction == 1 else entry_price + sl_distance
+                            tp_price = entry_price + tp_distance if direction == 1 else entry_price - tp_distance
+
+                            # 2. Calculate Internal Risk Sizing (Strict RL Parity)
+                            base_risk = current_bal * 0.015  
+                            friction_cost = 10.0
+                            
+                            # Model's intended dollar loss if SL is hit (matches xau_dynamic_env.py)
+                            intended_risk_amount = (base_risk * max(0.5, min(1.0, sl_mult_used))) + friction_cost
+                            
+                            # Lot Size = Intended Risk / (SL Distance in points * point value)
+                            calculated_lot_size = round(intended_risk_amount / (sl_distance * 100), 2)
+                            calculated_lot_size = max(0.01, calculated_lot_size) # MT5 Minimum
+                            
                             signal_data = {
                                 "type": "Long" if direction == 1 else "Short",
                                 "entry": entry_price,
-                                "sl": entry_price - (env_atr * sl_mult_used) if direction == 1 else entry_price + (env_atr * sl_mult_used),
-                                "tp": entry_price + (env_atr * tp_mult_used) if direction == 1 else entry_price - (env_atr * tp_mult_used),
-                                "risk_profile": f"SL Mult: {sl_mult_used:.2f} | TP Mult: {tp_mult_used:.2f}"
+                                "sl": sl_price,
+                                "tp": tp_price,
+                                "risk_profile": f"Risk: ${intended_risk_amount:.2f} | Lot Size: {calculated_lot_size}",
+                                "multiples": f"SL Mult: {sl_mult_used:.2f} | TP Mult: {tp_mult_used:.2f}"
                             }
                             
                             logger.info(f"[{timestamp}] 🚀 VALID SIGNAL. Dispatching via WA...")
