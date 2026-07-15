@@ -259,7 +259,24 @@ async def live_trading_loop():
 
                         # --- MASTER SLAVE TRIGGER (Symmetry with XAUDynamicEnv) ---
                         EXECUTION_THRESHOLD = 0.40
+                        # --- CONSOLE HEARTBEAT LOGGER ---
                         current_h4_trend = latest_features.get("h4_trend", 0.0)
+                        
+                        # Determine if we are currently blocked by environmental constraints
+                        cooldown_blocked = state.data["bars_since_last_trade"] < 4
+                        limit_blocked = state.data["trades_today"] >= MAX_TRADES_PER_DAY  # Ensure this variable matches your settings
+                        
+                        status_flag = "⏸️ COOLDOWN" if cooldown_blocked else ("🚫 LIMIT EXCEEDED" if limit_blocked else "🟢 READY")
+                        trend_direction = "UP" if current_h4_trend > 0 else "DOWN"
+
+                        logger.info(
+                            f"💓 HEARTBEAT [{timestamp.strftime('%H:%M:%S')}] | "
+                            f"Status: {status_flag:11} | "
+                            f"H4 Trend: {trend_direction} ({current_h4_trend:+.2f}) | "
+                            f"P_Hold: {prob_hold:.2%}, P_Long: {prob_long:.2%}, P_Short: {prob_short:.2%} | "
+                            f"SL Mult: {sl_mult_used:.2f}, TP Mult: {tp_mult_used:.2f} | "
+                            f"Bars Since: {state.data['bars_since_last_trade']}/4"
+                        )
                         env_atr = latest_features.get("env_atr", 1.0)
 
                         direction = 0
