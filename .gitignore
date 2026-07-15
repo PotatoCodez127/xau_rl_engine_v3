@@ -20,3 +20,4 @@ tests/
 subscribers.json
 test_xau_diagnostics.py
 visualize_performance.py
+fix_logs.py
