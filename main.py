@@ -44,6 +44,7 @@ MANAGER_ONNX_PATH = "models/deployed/manager_actor_v3.onnx"
 STATE_FILE = "logs/engine_state.json"
 NEURAL_LOG_PATH = "logs/neural_research_log_live.csv"
 JOURNAL_PATH = "logs/high_fidelity_journal_live.csv"
+MAX_TRADES_PER_DAY = 5
 
 wa_manager = WhatsAppCopilot()
 
@@ -269,7 +270,7 @@ async def live_trading_loop():
 
                         # Environment Caps Check
                         if direction != 0:
-                            if state.data["bars_since_last_trade"] < 4 or state.data["trades_today"] >= 1:
+                            if state.data["bars_since_last_trade"] < 4 or state.data["trades_today"] >= MAX_TRADES_PER_DAY:
                                 direction = 0
 
                         # --- EXECUTION DISPATCH ---

@@ -18,7 +18,7 @@ class XAUDynamicEnv(gym.Env):
         self.friction_cost = 10.0
 
         self.min_bars_between_trades = 4 
-        self.max_trades_per_day = 1       
+        self.max_trades_per_day = 5       
         
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
 
