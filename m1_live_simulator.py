@@ -263,11 +263,25 @@ class M1HighFidelitySimulator:
         bars_since_last_trade = 0 
 
         for idx, (timestamp, tick_row) in enumerate(self.feed.stream()):
-            if idx % 10000 == 0:
+            # Change this from 10000 to 1 to log EVERY single minute tick (60s backtest time)
+            if idx % 1 == 0:
               progress_pct = (idx / total_ticks) * 100
-              status = "WARMUP (In-Sample)" if idx < holdout_start_idx else "ACTIVE (Out-of-Sample)"
-              print(f"[{timestamp}] Progress: {progress_pct:.2f}% ({idx}/{total_ticks}) | Status: {status} | Equity: ${equity:.2f}")
-            
+              status = "WARMUP" if idx < holdout_start_idx else "ACTIVE"
+              
+              # Construct a status string for active trades
+              trade_status = "IDLE"
+              if active_trade is not None:
+                  trade_status = f"IN TRADE ({active_trade['type']} | Lot: {active_trade['lot_size']})"
+              elif pending_signal is not None:
+                  trade_status = "PENDING SIGNAL"
+                  
+              print(
+                  f"💓 [{timestamp.strftime('%Y-%m-%d %H:%M:%S')}] | "
+                  f"Status: {status:6} | "
+                  f"State: {trade_status:20} | "
+                  f"Equity: ${equity:.2f} | "
+                  f"Progress: {progress_pct:.2f}%"
+              )
             latest_15m_features = self.engine.process_m1_tick(timestamp, tick_row)
             if latest_15m_features is not None:
                 feature_vector = [latest_15m_features.get(c, 0.0) if not np.isnan(latest_15m_features.get(c, 0.0)) else 0.0 for c in self.feature_cols]
