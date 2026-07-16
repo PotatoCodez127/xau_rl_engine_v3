@@ -245,13 +245,36 @@ async def resolve_active_trade(tick_row, timestamp):
 async def live_trading_loop():
     logger.info("🚀 Initiating Deep Diagnostics Parity Live Loop...")
 
+    # ==============================================================
+    # DEEP HISTORICAL WARMUP WITH SEQUENTIAL PROBABILITY INJECTION
+    # ==============================================================
     try:
+        logger.info("⏳ Performing High-Fidelity Historical Sequence Warmup...")
         hist_df = await asyncio.to_thread(feed.fetch_historical_warmup, 15000)
+        
+        oracle_input_name = oracle_session.get_inputs()[0].name
+        
         for timestamp, row in hist_df.iterrows():
             features = feature_engine.process_m1_tick(timestamp, row.to_dict())
             if features is not None:
-                feature_buffer.append([features.get(c, 0.0) for c in feature_cols])
-        logger.info("✅ Engine Memory Saturated.")
+                feature_vector = [features.get(c, 0.0) for c in feature_cols]
+                
+                # If we have enough history, run historical Oracle prediction to populate memory realistically
+                if len(feature_buffer) == 30:
+                    # FIXED: Pass all 29 dimensions exactly as the ONNX graph expects
+                    buffer_array = np.array(feature_buffer, dtype=np.float32).reshape(1, 30, 29)
+                    
+                    logits = oracle_session.run(None, {oracle_input_name: buffer_array})
+                    probs = numpy_softmax(logits[0])[0]
+                    
+                    # Inject historical predictions back into the current step vector
+                    feature_vector[PROB_LONG_IDX] = probs[1]
+                    feature_vector[PROB_SHORT_IDX] = probs[2]
+                    feature_vector[PROB_HOLD_IDX] = probs[0]
+                
+                feature_buffer.append(feature_vector)
+                
+        logger.info(f"✅ Engine Memory Saturated with {len(feature_buffer)} True Historical Steps.")
     except Exception as e:
         logger.error(f"⚠️ Warmup Failed: {e}")
 
